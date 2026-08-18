@@ -47,7 +47,7 @@ func ParseSelector(value string) (Selector, error) {
 	if len(parts) == 2 {
 		selector.Container = strings.TrimSpace(parts[1])
 		if selector.Container == "" || strings.Contains(selector.Container, ":") {
-			return Selector{}, errors.New("Firefox container is invalid; provide one name after ::")
+			return Selector{}, errors.New("firefox container is invalid; provide one name after the :: separator")
 		}
 		selector.hasContainer = true
 	}
@@ -74,7 +74,5 @@ func ParseSelector(value string) (Selector, error) {
 }
 
 func hasControl(value string) bool {
-	return strings.IndexFunc(value, func(character rune) bool {
-		return unicode.IsControl(character)
-	}) >= 0
+	return strings.IndexFunc(value, unicode.IsControl) >= 0
 }

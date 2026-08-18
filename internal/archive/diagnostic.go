@@ -151,11 +151,10 @@ func sanitizeVideoJSON(raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if token, err := decoder.Token(); err != io.EOF {
+	if _, err := decoder.Token(); err != io.EOF {
 		if err != nil {
 			return nil, errors.New("sanitize unsupported video: malformed JSON")
 		}
-		_ = token
 		return nil, errors.New("sanitize unsupported video: multiple JSON values")
 	}
 	return value, nil
@@ -167,7 +166,6 @@ func sanitizeDiagnosticObject(decoder *json.Decoder, limits *diagnosticLimits, d
 	}
 	object := make(diagnosticObject)
 	seenKeys := make(map[string]struct{})
-	redactedKeys := make(map[string]struct{})
 	nextRedacted := 1
 	for decoder.More() {
 		keyToken, err := decoder.Token()
@@ -199,7 +197,6 @@ func sanitizeDiagnosticObject(decoder *json.Decoder, limits *diagnosticLimits, d
 		outputKey := key
 		if !validKey {
 			outputKey = nextDiagnosticRedactedKey(object, &nextRedacted)
-			redactedKeys[outputKey] = struct{}{}
 		} else if _, collision := object[key]; collision {
 			// A valid key can appear after an invalid key whose deterministic
 			// placeholder used the same spelling. Preserve the valid schema key
@@ -207,8 +204,6 @@ func sanitizeDiagnosticObject(decoder *json.Decoder, limits *diagnosticLimits, d
 			movedKey := nextDiagnosticRedactedKey(object, &nextRedacted)
 			object[movedKey] = object[key]
 			delete(object, key)
-			delete(redactedKeys, key)
-			redactedKeys[movedKey] = struct{}{}
 		}
 		object[outputKey] = value
 	}
@@ -403,11 +398,12 @@ var safeDiagnosticEnums = map[string]map[string]struct{}{
 }
 
 func safeDiagnosticEnum(field, value string) (string, bool) {
-	allowed, ok := safeDiagnosticEnums[strings.ToLower(field)]
+	field = strings.ToLower(field)
+	allowed, ok := safeDiagnosticEnums[field]
 	if !ok || len(value) == 0 || len(value) > maxVideoDiagnosticEnumBytes || !utf8.ValidString(value) {
 		return "", false
 	}
-	if fieldName := strings.ToLower(field); fieldName != "mime_type" {
+	if field != "mime_type" {
 		for _, character := range value {
 			if character > 0x7f || character == '/' || character == '\\' || character == '?' || character == '#' || character == '@' || character == '=' || character <= 0x20 || character == 0x7f {
 				return "", false

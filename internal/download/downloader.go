@@ -258,12 +258,9 @@ func (d *Downloader) process(ctx context.Context, s store.Store, work archive.Do
 		result.Failure = failure(CodeStaging)
 		return result
 	}
-	removeStage := true
 	defer func() {
 		_ = stage.Close()
-		if removeStage {
-			_ = os.Remove(stage.Name())
-		}
+		_ = os.Remove(stage.Name())
 	}()
 	if err := stage.Chmod(0600); err != nil {
 		result.Failure = failure(CodeStaging)
@@ -317,7 +314,6 @@ const (
 
 type fetchResult struct {
 	kind    fetchKind
-	quality string
 	digest  string
 	failure *Failure
 }
@@ -351,11 +347,10 @@ func (d *Downloader) fetchSource(ctx context.Context, stage *os.File, work archi
 }
 
 func mediaLimit(sourceBytes int64) int64 {
-	limit := maxEncodedBytes
-	if sourceBytes > 0 {
-		limit = min(maxEncodedBytes, max(sourceBytes*2, minResponseSlack))
+	if sourceBytes <= 0 {
+		return maxEncodedBytes
 	}
-	return limit
+	return min(maxEncodedBytes, max(sourceBytes*2, minResponseSlack))
 }
 
 func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *url.URL, limit int64) fetchResult {
@@ -375,7 +370,7 @@ func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *u
 		response, err := d.client.Do(request)
 		if err != nil {
 			if response != nil && response.Body != nil {
-				closeResponse(response)
+				_ = response.Body.Close()
 			}
 			if errors.Is(err, errRedirect) {
 				return fetchResult{kind: fetchFailure, failure: failure(CodeRedirect)}
@@ -763,10 +758,4 @@ func drainAndClose(body io.ReadCloser) {
 	}
 	_, _ = io.CopyN(io.Discard, body, maxDrainBytes)
 	_ = body.Close()
-}
-
-func closeResponse(response *http.Response) {
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/browserutils/kooky/browser/firefox"
 	"github.com/browserutils/kooky/browser/safari"
 	sqlite3 "github.com/ncruces/go-sqlite3"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"pixiegrabber/internal/privatefs"
 )
 
@@ -50,7 +49,7 @@ type Session struct {
 
 var (
 	errSnapshotSchema           = errors.New("selected browser cookie schema could not be inspected; close the browser and retry")
-	errFirefoxContainerMetadata = errors.New("Firefox container metadata is required for container cookies; restore containers.json and retry")
+	errFirefoxContainerMetadata = errors.New("firefox container metadata is required for container cookies; restore containers.json and retry")
 )
 
 // Load imports valid Pixieset cookies from one selected browser profile.
@@ -416,7 +415,7 @@ func firefoxContainersReadable(snapshotPath string) bool {
 		return false
 	}
 	data, err := os.ReadFile(filename)
-	if err != nil || !json.Valid(data) {
+	if err != nil {
 		return false
 	}
 	var metadata struct {
@@ -671,13 +670,13 @@ func matchesContainer(selector Selector, cookie *kooky.Cookie) bool {
 	if !strings.EqualFold(selector.Browser, "firefox") {
 		return true
 	}
-	if !selector.hasContainer {
-		return cookie != nil && cookie.Container == ""
+	if cookie == nil {
+		return false
 	}
-	if strings.EqualFold(selector.Container, "none") {
-		return cookie != nil && cookie.Container == ""
+	if !selector.hasContainer || strings.EqualFold(selector.Container, "none") {
+		return cookie.Container == ""
 	}
-	return cookie != nil && cookie.Container == selector.Container
+	return cookie.Container == selector.Container
 }
 
 func cookieFilters(selector Selector) []kooky.Filter {

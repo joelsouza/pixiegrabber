@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -165,7 +166,7 @@ func (f *FS) mkdirAll(rel string) error {
 	if err != nil {
 		return opError("mkdir all", err)
 	}
-	if containsLockName(parts) {
+	if slices.Contains(parts, lockName) {
 		return opError("mkdir all", errLockName)
 	}
 	if err := f.ensureDirectories(parts); err != nil {
@@ -350,7 +351,7 @@ func (f *FS) tempFile(dir, prefix string) (*os.File, string, error) {
 			return nil, "", opError("create temp", err)
 		}
 	}
-	if containsLockName(dirParts) {
+	if slices.Contains(dirParts, lockName) {
 		return nil, "", opError("create temp", errLockName)
 	}
 	parent, pinned, err := f.pinParent(dirParts)
@@ -386,7 +387,7 @@ func (f *FS) atomicReplace(rel string, write func(io.Writer) error) (result erro
 	if err != nil {
 		return opError("atomic replace", err)
 	}
-	if containsLockName(parts) {
+	if slices.Contains(parts, lockName) {
 		return opError("atomic replace", errLockName)
 	}
 	parentParts := parts[:len(parts)-1]
@@ -463,7 +464,7 @@ func (f *FS) remove(rel string) (result error) {
 	if err != nil {
 		return opError("remove", err)
 	}
-	if containsLockName(parts) {
+	if slices.Contains(parts, lockName) {
 		return opError("remove", errLockName)
 	}
 	parent, pinned, err := f.pinParent(parts[:len(parts)-1])
@@ -524,7 +525,7 @@ func (f *FS) readDir(rel string) (entries []os.DirEntry, result error) {
 	if err != nil {
 		return nil, opError("read dir", err)
 	}
-	if containsLockName(parts) {
+	if slices.Contains(parts, lockName) {
 		return nil, opError("read dir", errLockName)
 	}
 	parent, pinned, err := f.pinParent(parts[:len(parts)-1])
@@ -978,15 +979,6 @@ func joinRelative(dir, leaf string) string {
 		return leaf
 	}
 	return dir + "/" + leaf
-}
-
-func containsLockName(parts []string) bool {
-	for _, part := range parts {
-		if part == lockName {
-			return true
-		}
-	}
-	return false
 }
 
 func opError(operation string, err error) error {

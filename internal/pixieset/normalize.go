@@ -14,7 +14,7 @@ import (
 const maxStringBytes = 4096
 
 func normalizeID(value string) (string, error) {
-	if len(value) < 1 || len(value) > 20 {
+	if len(value) == 0 || len(value) > 20 {
 		return "", errors.New("ID must contain 1 to 20 ASCII digits")
 	}
 	for _, character := range value {
@@ -303,7 +303,7 @@ func normalizeMediaURL(value string, baseURL *url.URL) (string, error) {
 }
 
 func nullableDate(raw json.RawMessage) (*time.Time, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	if len(raw) == 0 {
 		return nil, nil
 	}
 	value := strings.TrimSpace(string(raw))

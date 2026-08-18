@@ -95,15 +95,7 @@ func component(name, stableID, suffix string) string {
 }
 
 func cleanName(name string) string {
-	var b strings.Builder
-	for _, r := range strings.ToValidUTF8(name, "�") {
-		if unsafeRune(r) {
-			b.WriteByte('_')
-			continue
-		}
-		b.WriteRune(r)
-	}
-	clean := strings.TrimRight(b.String(), " .")
+	clean := cleanComponent(name)
 	if clean == "" || clean == "." || clean == ".." {
 		return fallbackName
 	}
@@ -111,15 +103,7 @@ func cleanName(name string) string {
 }
 
 func cleanStableID(id string) string {
-	var b strings.Builder
-	for _, r := range strings.ToValidUTF8(id, "�") {
-		if unsafeRune(r) {
-			b.WriteByte('_')
-			continue
-		}
-		b.WriteRune(r)
-	}
-	clean := strings.TrimRight(b.String(), " .")
+	clean := cleanComponent(id)
 	if clean == "" {
 		return "unknown"
 	}
@@ -129,8 +113,12 @@ func cleanStableID(id string) string {
 func cleanExtension(extension string) string {
 	extension = strings.TrimSpace(extension)
 	extension = strings.TrimLeft(extension, ".")
+	return cleanComponent(extension)
+}
+
+func cleanComponent(value string) string {
 	var b strings.Builder
-	for _, r := range strings.ToValidUTF8(extension, "�") {
+	for _, r := range strings.ToValidUTF8(value, "�") {
 		if unsafeRune(r) {
 			b.WriteByte('_')
 			continue

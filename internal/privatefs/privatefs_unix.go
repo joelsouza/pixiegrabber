@@ -5,6 +5,7 @@ package privatefs
 import (
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // CreateTemp creates a new owner-only temporary regular file in dir. The last
@@ -255,8 +256,6 @@ func pathComponents(path string) []string {
 		}
 		clean = parent
 	}
-	for left, right := 0, len(components)-1; left < right; left, right = left+1, right-1 {
-		components[left], components[right] = components[right], components[left]
-	}
+	slices.Reverse(components)
 	return components
 }

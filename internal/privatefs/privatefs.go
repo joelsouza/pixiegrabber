@@ -5,8 +5,6 @@
 package privatefs
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -15,8 +13,6 @@ import (
 const (
 	privateFileMode os.FileMode = 0600
 	privateDirMode  os.FileMode = 0700
-	tempNameBytes               = 16
-	maxTempAttempts             = 100
 )
 
 var (
@@ -51,19 +47,4 @@ func wrap(op string, err error) error {
 		err = pathErr.Err
 	}
 	return &os.PathError{Op: op, Err: err}
-}
-
-func randomTempComponent() (string, error) {
-	var bytes [tempNameBytes]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes[:]), nil
-}
-
-func tempName(pattern, random string) string {
-	if star := strings.LastIndexByte(pattern, '*'); star >= 0 {
-		return pattern[:star] + random + pattern[star+1:]
-	}
-	return pattern + random
 }

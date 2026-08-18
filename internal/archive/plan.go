@@ -145,7 +145,7 @@ func MarkSourceMissing(s store.Store, previous manifest.Manifest, now time.Time)
 
 	next := cloneManifest(previous)
 	next.Collection.PresenceState = manifest.PresenceMissing
-	next.Collection.LastDiscoveryAt = timePointer(normalizeTime(now))
+	next.Collection.LastDiscoveryAt = timePointer(now)
 	for i := range next.Sets {
 		next.Sets[i].PresenceState = manifest.PresenceMissing
 	}
@@ -190,7 +190,7 @@ func validateSets(source pixieset.Collection, sets []pixieset.Set) ([]pixieset.S
 			return nil, nil, err
 		}
 		if set.CollectionID != source.ID {
-			return nil, nil, fmt.Errorf("Set %q does not belong to Collection %q", set.ID, source.ID)
+			return nil, nil, fmt.Errorf("set %q does not belong to collection %q", set.ID, source.ID)
 		}
 		if _, exists := byID[set.ID]; exists {
 			return nil, nil, fmt.Errorf("duplicate Set ID %q", set.ID)
@@ -406,6 +406,7 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 	var renames []Rename
 	for _, current := range currentReferences {
 		reference, existed := oldReferences[current.photo.ID]
+		delete(oldReferences, current.photo.ID)
 		if !existed {
 			reference = manifest.Reference{ID: current.photo.ID, Placements: []manifest.Placement{}}
 		}
@@ -424,6 +425,7 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 			sourceSet := setByID[setID]
 			relativePath := portablePlacementPath(sourceSet, current.photo)
 			placement, existed := oldPlacements[setID]
+			delete(oldPlacements, setID)
 			if !existed {
 				currentExists, _, err := inspectFile(s, rootPlan.directory, relativePath, "", false)
 				if err != nil {
@@ -519,9 +521,6 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 			}
 		}
 		for _, oldPlacement := range oldPlacements {
-			if containsString(current.setIDs, oldPlacement.SetID) {
-				continue
-			}
 			oldPlacement.PresenceState = manifest.PresenceMissing
 			reference.Placements = append(reference.Placements, oldPlacement)
 		}
@@ -538,9 +537,6 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 		next.References = append(next.References, reference)
 	}
 	for _, oldReference := range oldReferences {
-		if containsCurrentReference(currentReferences, oldReference.ID) {
-			continue
-		}
 		oldReference.PresenceState = manifest.PresenceMissing
 		for i := range oldReference.Placements {
 			oldReference.Placements[i].PresenceState = manifest.PresenceMissing
@@ -645,7 +641,11 @@ func setReferenceDownloadState(reference *manifest.Reference, existed bool) {
 }
 
 func validFailure(failure *manifest.Failure) bool {
-	return failure != nil && failure.Code != "" && strings.TrimSpace(failure.Code) == failure.Code && failure.Message != "" && strings.TrimSpace(failure.Message) == failure.Message && !strings.Contains(strings.ToLower(failure.Code), "://") && !strings.Contains(strings.ToLower(failure.Message), "://")
+	return failure != nil && validFailureText(failure.Code) && validFailureText(failure.Message)
+}
+
+func validFailureText(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && !strings.Contains(strings.ToLower(value), "://")
 }
 
 func runState(m manifest.Manifest) manifest.RunState {
@@ -940,24 +940,6 @@ func validInputID(subject, value string) error {
 func setPending(placement *manifest.Placement) {
 	placement.DownloadState = manifest.DownloadPending
 	placement.Failure = nil
-}
-
-func containsString(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-	return false
-}
-
-func containsCurrentReference(values []currentReference, id string) bool {
-	for _, value := range values {
-		if value.photo.ID == id {
-			return true
-		}
-	}
-	return false
 }
 
 func sameTime(left, right *time.Time) bool {

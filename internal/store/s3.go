@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path"
 	"strings"
@@ -112,17 +113,20 @@ func (s *S3Store) Inspect(rel string) (os.FileInfo, bool, error) {
 	}
 	// Probe for a directory prefix: any child under rel/ means rel is a
 	// directory.
-	children := s.client.ListObjects(context.Background(), s.bucket, minio.ListObjectsOptions{
+	children := s.client.ListObjectsIter(context.Background(), s.bucket, minio.ListObjectsOptions{
 		Prefix:  rel + "/",
 		MaxKeys: 1,
 	})
-	for child := range children {
-		if child.Err != nil {
-			return nil, false, child.Err
-		}
-		return s3FileInfo{dir: true, name: rel}, true, nil
+	next, stop := iter.Pull(children)
+	defer stop()
+	child, ok := next()
+	if !ok {
+		return nil, false, nil
 	}
-	return nil, false, nil
+	if child.Err != nil {
+		return nil, false, child.Err
+	}
+	return s3FileInfo{dir: true, name: rel}, true, nil
 }
 
 // ReadDir lists the entries in a directory. A rel of "" or "." lists the root.

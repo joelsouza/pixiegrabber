@@ -346,10 +346,7 @@ func executePlan(ctx context.Context, s store.Store, concurrency int, mediaOrigi
 		results := downloader.Download(ctx, s, plan.Downloads)
 		applyResults(&plan.Manifest, results, now)
 	}
-	if err := manifest.Write(s, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest); err != nil {
-		return err
-	}
-	return nil
+	return manifest.Write(s, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest)
 }
 
 func applyRename(s store.Store, rename archive.Rename) error {
