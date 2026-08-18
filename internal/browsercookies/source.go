@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,13 +45,42 @@ type Session struct {
 	Jar       http.CookieJar
 	Browser   string
 	Profile   string
+	Container string
 	UserAgent string
+
+	// SessionCookies, TokenCookies and Cookies count the imported cookies by
+	// class. They hold counts only, never a cookie value.
+	SessionCookies int
+	TokenCookies   int
+	Cookies        int
+}
+
+// Selector returns the --cookies-from-browser value that selects this session
+// again. A profile name can hold a space, so quote it in a printed command.
+func (s Session) Selector() string {
+	value := s.Browser
+	if s.Profile != "" {
+		value += ":" + s.Profile
+	}
+	if s.Container != "" {
+		value += "::" + s.Container
+	}
+	return value
 }
 
 var (
-	errSnapshotSchema           = errors.New("selected browser cookie schema could not be inspected; close the browser and retry")
+	errSnapshotSchema = errors.New("selected browser cookie schema could not be inspected; choose another profile and retry")
+	errSnapshotCopy   = errors.New("selected browser cookie store could not be copied; make sure the file exists and the disk has free space")
+	// macOS keeps the Safari cookie file behind a privacy control, so a copy
+	// fails until the terminal gets Full Disk Access.
+	errSnapshotPermission       = errors.New("selected browser cookie store could not be read; give your terminal Full Disk Access in System Settings and retry")
+	errSnapshotIntegrity        = errors.New("selected browser cookie data is damaged; choose another profile and retry")
 	errFirefoxContainerMetadata = errors.New("firefox container metadata is required for container cookies; restore containers.json and retry")
 )
+
+// sqliteSidecarSuffixes names the write-ahead log files that hold the newest
+// rows of a live SQLite database.
+var sqliteSidecarSuffixes = [...]string{"-wal", "-shm"}
 
 // Load imports valid Pixieset cookies from one selected browser profile.
 func Load(ctx context.Context, value string) (Session, error) {
@@ -82,10 +112,11 @@ func loadWith(ctx context.Context, selector Selector, sequence kooky.CookieStore
 		return Session{}, err
 	}
 
-	selected, err := selectStore(selector, stores)
+	selection, err := selectStore(selector, stores)
 	if err != nil {
 		return Session{}, err
 	}
+	selected := selection.store
 	userAgent := detectUserAgent(ctx, selected)
 	cookies, cleanup, err := reader(selected, cookieFilters(selector)...)
 	if err != nil {
@@ -105,10 +136,11 @@ func loadWith(ctx context.Context, selector Selector, sequence kooky.CookieStore
 		return Session{}, errors.New("create in-memory cookie jar: initialization failed")
 	}
 
-	count := 0
+	imported := make(map[string][]*http.Cookie)
+	scores := make(candidateGroups)
 	for cookie, readErr := range cookies {
 		if readErr != nil {
-			return Session{}, errors.New("read selected browser cookie store: browser data could not be read; close the browser or choose another profile")
+			return Session{}, errors.New("read selected browser cookie store: browser data could not be read; choose another profile")
 		}
 		if err := ctx.Err(); err != nil {
 			return Session{}, err
@@ -116,17 +148,69 @@ func loadWith(ctx context.Context, selector Selector, sequence kooky.CookieStore
 		if !isPixiesetCookie(cookie) || !matchesContainer(selector, cookie) || !kooky.Valid.Filter(cookie) {
 			continue
 		}
-		copy := cookie.Cookie
+		entry := cookie.Cookie
 		// SetCookies receives galleriesURL, so an empty Domain makes this
 		// cookie host-only for galleries.pixieset.com.
-		copy.Domain = ""
-		jar.SetCookies(galleriesURL, []*http.Cookie{&copy})
-		count++
+		entry.Domain = ""
+		imported[cookie.Container] = append(imported[cookie.Container], &entry)
+		scores[cookie.Container] = scores[cookie.Container].add(cookie.Name)
 	}
-	if count == 0 {
-		return Session{}, errors.New("no valid Pixieset cookies found in the selected profile; sign in to Pixieset and retry")
+	if len(imported) == 0 {
+		return Session{}, noPixiesetCookiesError(selection)
 	}
-	return Session{Jar: jar, Browser: selected.Browser(), Profile: selected.Profile(), UserAgent: userAgent}, nil
+	// One container alone fills the jar. Cookies from two containers belong to
+	// two different sessions, and a mix of them is a broken session.
+	container, score := scores.best()
+	jar.SetCookies(galleriesURL, imported[container])
+	return Session{
+		Jar:            jar,
+		Browser:        selected.Browser(),
+		Profile:        selected.Profile(),
+		Container:      container,
+		UserAgent:      userAgent,
+		SessionCookies: score.session,
+		TokenCookies:   score.token,
+		Cookies:        score.total,
+	}, nil
+}
+
+// noPixiesetCookiesError names every profile that the search examined, so the
+// user can see what was found and can select one profile without a guess. It
+// gives counts only, and no file path.
+func noPixiesetCookiesError(selection storeSelection) error {
+	var message strings.Builder
+	message.WriteString("no valid Pixieset cookies found; sign in to Pixieset and retry")
+	scanned := selection.scanned
+	if len(scanned) == 0 {
+		scanned = []candidateEvidence{selection.evidence}
+	}
+	for _, evidence := range scanned {
+		if isNilStore(evidence.candidate.store) {
+			continue
+		}
+		message.WriteString("\n  ")
+		message.WriteString(evidence.candidate.store.Browser())
+		if profile := evidence.candidate.store.Profile(); profile != "" {
+			message.WriteString(":" + profile)
+		}
+		// The container completes the value, so the whole name can go straight
+		// back into --cookies-from-browser.
+		if evidence.container != "" {
+			message.WriteString("::" + evidence.container)
+		}
+		message.WriteString(" — ")
+		switch {
+		case evidence.err != nil:
+			message.WriteString("the cookie database could not be read")
+		case evidence.score.total == 0:
+			message.WriteString("0 Pixieset cookies")
+		case evidence.score.session == 0:
+			fmt.Fprintf(&message, "%d Pixieset cookies, no session cookie", evidence.score.total)
+		default:
+			fmt.Fprintf(&message, "%d Pixieset cookies", evidence.score.total)
+		}
+	}
+	return errors.New(message.String())
 }
 
 func liveReader(store kooky.CookieStore, filters ...kooky.Filter) (kooky.CookieSeq, func() error, error) {
@@ -176,10 +260,16 @@ func sanitizeReaderError(err error) error {
 	switch {
 	case errors.Is(err, errSnapshotSchema):
 		return errSnapshotSchema
+	case errors.Is(err, errSnapshotCopy):
+		return errSnapshotCopy
+	case errors.Is(err, errSnapshotPermission):
+		return errSnapshotPermission
+	case errors.Is(err, errSnapshotIntegrity):
+		return errSnapshotIntegrity
 	case errors.Is(err, errFirefoxContainerMetadata):
 		return errFirefoxContainerMetadata
 	default:
-		return errors.New("read selected browser cookie store: browser data could not be opened; close the browser or choose another profile")
+		return errors.New("read selected browser cookie store: browser data could not be opened; choose another profile")
 	}
 }
 
@@ -202,6 +292,10 @@ func snapshotStoreWithPath(source kooky.CookieStore, open storeOpener) (kooky.Co
 	snapshotPath, err := copyCookieStore(source.Browser(), source.FilePath(), root)
 	if err != nil {
 		_ = remove()
+		// The sentinels name a cause the user can act on and hold no path.
+		if errors.Is(err, errSnapshotCopy) || errors.Is(err, errSnapshotPermission) || errors.Is(err, errSnapshotIntegrity) {
+			return nil, "", nil, err
+		}
 		return nil, "", nil, errors.New("copy selected browser cookie store: snapshot could not be created")
 	}
 	store, err := open(source.Browser(), snapshotPath)
@@ -237,7 +331,7 @@ func copyCookieStore(browser, source, root string) (string, error) {
 		destinationDir = filepath.Join(root, "Profile")
 		containers := filepath.Join(filepath.Dir(source), "containers.json")
 		// Container metadata is optional when the database has no container
-		// rows. Its requirement is checked after the coherent backup.
+		// rows. Its requirement is checked after the snapshot.
 		_ = copyOptionalFile(containers, filepath.Join(destinationDir, "containers.json"))
 	case "safari":
 		destinationDir = root
@@ -250,7 +344,7 @@ func copyCookieStore(browser, source, root string) (string, error) {
 	destination := filepath.Join(destinationDir, filepath.Base(source))
 	switch strings.ToLower(browser) {
 	case "brave", "chrome", "chromium", "edge", "firefox":
-		if err := backupSQLiteDatabase(source, destination); err != nil {
+		if err := snapshotSQLiteDatabase(source, destination); err != nil {
 			return "", err
 		}
 	case "safari":
@@ -261,7 +355,10 @@ func copyCookieStore(browser, source, root string) (string, error) {
 	return destination, nil
 }
 
-func backupSQLiteDatabase(source, destination string) error {
+// snapshotSQLiteDatabase copies a live SQLite database to destination. A byte
+// copy takes no lock, so the browser can stay open. The SQLite backup API
+// cannot do this: Firefox holds cookies.sqlite in exclusive lock mode.
+func snapshotSQLiteDatabase(source, destination string) error {
 	if !isRegularFile(source) {
 		return errors.New("source is not a regular SQLite database")
 	}
@@ -271,7 +368,81 @@ func backupSQLiteDatabase(source, destination string) error {
 		return err
 	}
 
-	db, err := sqlite3.OpenFlags(source, sqlite3.OPEN_READONLY|sqlite3.OPEN_URI)
+	if err := copySQLiteSnapshot(source, destination, true); err == nil {
+		return nil
+	}
+	// The browser can write while the copy runs, which leaves a write-ahead log
+	// that does not agree with the main file. The main file alone is coherent
+	// and holds almost every cookie.
+	if err := removeSQLiteSnapshot(destination); err != nil {
+		return errSnapshotCopy
+	}
+	return copySQLiteSnapshot(source, destination, false)
+}
+
+// snapshotCopyError names the cause of a failed copy, so that a privacy
+// control is not reported as a full disk.
+func snapshotCopyError(err error) error {
+	if errors.Is(err, os.ErrPermission) {
+		return errSnapshotPermission
+	}
+	return errSnapshotCopy
+}
+
+func copySQLiteSnapshot(source, destination string, sidecars bool) error {
+	if err := copyFile(source, destination); err != nil {
+		return snapshotCopyError(err)
+	}
+	if err := privatefs.Restrict(destination, false); err != nil {
+		return errSnapshotCopy
+	}
+	if sidecars {
+		for _, suffix := range sqliteSidecarSuffixes {
+			if err := copySidecarFile(source+suffix, destination+suffix); err != nil {
+				return errSnapshotCopy
+			}
+		}
+	}
+	if err := recoverSQLiteSnapshot(destination); err != nil {
+		return errSnapshotIntegrity
+	}
+	if err := validateSQLiteIntegrity(destination); err != nil {
+		return errSnapshotIntegrity
+	}
+	return nil
+}
+
+func copySidecarFile(source, destination string) error {
+	if err := copyOptionalFile(source, destination); err != nil {
+		return err
+	}
+	if !isRegularFile(destination) {
+		return nil
+	}
+	return privatefs.Restrict(destination, false)
+}
+
+func removeSQLiteSnapshot(destination string) error {
+	names := make([]string, 0, len(sqliteSidecarSuffixes)+1)
+	names = append(names, destination)
+	for _, suffix := range sqliteSidecarSuffixes {
+		names = append(names, destination+suffix)
+	}
+	var errs []error
+	for _, name := range names {
+		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// recoverSQLiteSnapshot folds the copied write-ahead log into the copied main
+// file. The connection must be read-write, because SQLite cannot replay a
+// write-ahead log on a read-only connection. The later read-only readers then
+// see every row.
+func recoverSQLiteSnapshot(filename string) error {
+	db, err := sqlite3.Open(filename)
 	if err != nil {
 		return err
 	}
@@ -279,45 +450,41 @@ func backupSQLiteDatabase(source, destination string) error {
 		_ = db.Close()
 		return err
 	}
-	backupErr := db.Backup("main", destination)
-	closeErr := db.Close()
-	if backupErr != nil {
-		return backupErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err := privatefs.Restrict(destination, false); err != nil {
+	if err := checkSQLiteIntegrity(db); err != nil {
+		_ = db.Close()
 		return err
 	}
-	return validateSQLiteIntegrity(destination)
+	checkpointErr := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return errors.Join(checkpointErr, db.Close())
 }
 
 func validateSQLiteIntegrity(filename string) error {
-	db, err := sqlite3.OpenFlags(filename, sqlite3.OPEN_READONLY|sqlite3.OPEN_URI)
+	db, err := openInspectionDatabase(filename)
 	if err != nil {
 		return err
 	}
-	if err := db.BusyTimeout(sqliteBusyTimeout); err != nil {
+	if err := checkSQLiteIntegrity(db); err != nil {
 		_ = db.Close()
 		return err
 	}
+	return db.Close()
+}
+
+func checkSQLiteIntegrity(db *sqlite3.Conn) error {
 	stmt, _, err := db.Prepare("PRAGMA integrity_check")
 	if err != nil {
-		_ = db.Close()
 		return err
 	}
 	ok := stmt.Step() && stmt.ColumnText(0) == "ok" && stmt.Err() == nil
 	stepErr := stmt.Err()
-	closeStmtErr := stmt.Close()
-	closeDBErr := db.Close()
+	closeErr := stmt.Close()
 	if !ok {
 		if stepErr != nil {
 			return stepErr
 		}
 		return errors.New("SQLite integrity check failed")
 	}
-	return errors.Join(closeStmtErr, closeDBErr)
+	return closeErr
 }
 
 type cookieIdentity struct {
@@ -405,25 +572,298 @@ func firefoxContainerRows(filename string) (bool, error) {
 }
 
 func firefoxUserContextOrigin(origin string) bool {
-	return origin != "" && strings.Contains(origin, "userContextId")
+	_, contained := firefoxUserContext(origin)
+	return contained
+}
+
+// firefoxUserContext reads the container number from one originAttributes
+// value. The format is ^key=value&key=value. Container zero is the ordinary
+// browsing context, which holds no container.
+func firefoxUserContext(origin string) (int, bool) {
+	attributes, prefixed := strings.CutPrefix(origin, "^")
+	if !prefixed {
+		return 0, false
+	}
+	for _, attribute := range strings.Split(attributes, "&") {
+		key, value, separated := strings.Cut(attribute, "=")
+		if !separated || key != "userContextId" {
+			continue
+		}
+		number, err := strconv.Atoi(value)
+		if err != nil || number <= 0 {
+			return 0, false
+		}
+		return number, true
+	}
+	return 0, false
+}
+
+// inspectCandidate counts the Pixieset cookies of one candidate and groups them
+// by container. It selects no value column, so macOS asks for no Keychain
+// permission before one profile wins.
+func inspectCandidate(browser, path string) (candidateGroups, error) {
+	if strings.EqualFold(browser, "safari") {
+		return inspectSafariCandidate(path)
+	}
+	// A snapshot holds no containers.json, so the container names always come
+	// from the original profile directory.
+	containers := firefoxContainerNames(browser, path)
+	// The live file needs no copy and takes no lock, so this path stays fast.
+	// immutable=1 hides the write-ahead log, so a store whose newest rows live
+	// only in that log, or a store that changes during the read, is read again
+	// from a snapshot.
+	groups, err := inspectDatabase(browser, immutableURI(path), containers)
+	if err == nil && (len(groups) > 0 || !hasWriteAheadLog(path)) {
+		return groups, nil
+	}
+	return inspectSnapshotCandidate(browser, path, containers)
+}
+
+// immutableURI names one live database as a SQLite URI. The escape keeps a
+// space, a question mark or a number sign in the path out of the query.
+func immutableURI(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		absolute = path
+	}
+	name := filepath.ToSlash(absolute)
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	uri := url.URL{Scheme: "file", Path: name, RawQuery: "immutable=1"}
+	return uri.String()
+}
+
+func hasWriteAheadLog(path string) bool {
+	info, err := os.Stat(path + sqliteSidecarSuffixes[0])
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func inspectSnapshotCandidate(browser, path string, containers map[int]string) (candidateGroups, error) {
+	root, err := makeSnapshotTempDir("", "pixiegrabber-cookies-")
+	if err != nil {
+		return nil, errSnapshotCopy
+	}
+	defer removeSnapshotDir(root)
+	snapshot := filepath.Join(root, filepath.Base(path))
+	if err := snapshotSQLiteDatabase(path, snapshot); err != nil {
+		return nil, err
+	}
+	return inspectDatabase(browser, snapshot, containers)
+}
+
+// inspectSafariCandidate reads Cookies.binarycookies, which holds no SQLite
+// database. Safari keeps its cookie values in the clear, so this read asks for
+// no Keychain permission either.
+func inspectSafariCandidate(path string) (candidateGroups, error) {
+	root, err := makeSnapshotTempDir("", "pixiegrabber-cookies-")
+	if err != nil {
+		return nil, errSnapshotCopy
+	}
+	defer removeSnapshotDir(root)
+	snapshot := filepath.Join(root, filepath.Base(path))
+	if err := copyFile(path, snapshot); err != nil {
+		return nil, snapshotCopyError(err)
+	}
+	store, err := openSnapshotCookieStore("safari", snapshot)
+	if err != nil || isNilStore(store) {
+		return nil, errSnapshotSchema
+	}
+	defer store.Close()
+	groups := make(candidateGroups)
+	for cookie, readErr := range store.TraverseCookies() {
+		if readErr != nil {
+			return nil, errSnapshotSchema
+		}
+		if !isPixiesetCookie(cookie) || !kooky.Valid.Filter(cookie) {
+			continue
+		}
+		groups[cookie.Container] = groups[cookie.Container].add(cookie.Name)
+	}
+	return groups, nil
+}
+
+func inspectDatabase(browser, filename string, containers map[int]string) (candidateGroups, error) {
+	db, err := openInspectionDatabase(filename)
+	if err != nil {
+		return nil, errSnapshotSchema
+	}
+	defer db.Close()
+	switch strings.ToLower(browser) {
+	case "brave", "chrome", "chromium", "edge":
+		return inspectChromiumRows(db, time.Now())
+	case "firefox":
+		return inspectFirefoxRows(db, time.Now(), containers)
+	default:
+		return nil, errSnapshotSchema
+	}
+}
+
+// chromiumEpochOffset converts the Chromium clock, which counts microseconds
+// from 1601-01-01, to the Unix clock.
+const chromiumEpochOffset = 11644473600000000
+
+func inspectChromiumRows(db *sqlite3.Conn, now time.Time) (candidateGroups, error) {
+	columns, err := sqliteTableColumns(db, "cookies")
+	if err != nil || !columns["host_key"] || !columns["name"] {
+		return nil, errSnapshotSchema
+	}
+	// The query names no value column, so the store decrypts nothing.
+	stmt, _, err := db.Prepare("SELECT host_key, name, " + numberColumn(columns, "expires_utc") + ", " + numberColumn(columns, "is_persistent") + " FROM cookies")
+	if err != nil {
+		return nil, errSnapshotSchema
+	}
+	groups := make(candidateGroups)
+	for stmt.Step() {
+		if !isPixiesetHost(stmt.ColumnText(0)) || chromiumExpired(stmt.ColumnInt64(2), stmt.ColumnInt64(3) != 0, now) {
+			continue
+		}
+		groups[""] = groups[""].add(stmt.ColumnText(1))
+	}
+	return groups, finishInspection(stmt)
+}
+
+func inspectFirefoxRows(db *sqlite3.Conn, now time.Time, containers map[int]string) (candidateGroups, error) {
+	columns, err := sqliteTableColumns(db, "moz_cookies")
+	if err != nil || !columns["host"] || !columns["name"] {
+		return nil, errSnapshotSchema
+	}
+	stmt, _, err := db.Prepare("SELECT host, name, " + numberColumn(columns, "expiry") + ", " + textColumn(columns, "originAttributes") + " FROM moz_cookies")
+	if err != nil {
+		return nil, errSnapshotSchema
+	}
+	groups := make(candidateGroups)
+	for stmt.Step() {
+		if !isPixiesetHost(stmt.ColumnText(0)) || firefoxExpired(stmt.ColumnInt64(2), now) {
+			continue
+		}
+		container := ""
+		if number, contained := firefoxUserContext(stmt.ColumnText(3)); contained {
+			container = firefoxContainerName(containers, number)
+		}
+		groups[container] = groups[container].add(stmt.ColumnText(1))
+	}
+	return groups, finishInspection(stmt)
+}
+
+// firefoxContainerName names one container as the user sees it, so that a
+// reported container can go straight back into the selector. kooky keeps the
+// number when the metadata names no container, and this rule agrees with it.
+func firefoxContainerName(containers map[int]string, number int) string {
+	if name := containers[number]; name != "" {
+		return name
+	}
+	return strconv.Itoa(number)
+}
+
+func finishInspection(stmt *sqlite3.Stmt) error {
+	stepErr := stmt.Err()
+	closeErr := stmt.Close()
+	if stepErr != nil || closeErr != nil {
+		return errSnapshotSchema
+	}
+	return nil
+}
+
+// numberColumn and textColumn keep an older schema readable. The name comes
+// from the schema itself, so the query holds no outside text.
+func numberColumn(columns map[string]bool, name string) string {
+	if columns[name] {
+		return name
+	}
+	return "0"
+}
+
+func textColumn(columns map[string]bool, name string) string {
+	if columns[name] {
+		return name
+	}
+	return "''"
+}
+
+func chromiumExpired(expires int64, persistent bool, now time.Time) bool {
+	if !persistent || expires <= 0 {
+		return false
+	}
+	return time.UnixMicro(expires - chromiumEpochOffset).Before(now)
+}
+
+// firefoxExpired reads moz_cookies.expiry. Firefox 142 changed the unit from
+// seconds to milliseconds, so a row counts as expired only when both readings
+// are in the past.
+func firefoxExpired(expiry int64, now time.Time) bool {
+	if expiry <= 0 {
+		return false
+	}
+	return time.Unix(expiry, 0).Before(now) && time.UnixMilli(expiry).Before(now)
 }
 
 func firefoxContainersReadable(snapshotPath string) bool {
-	filename := filepath.Join(filepath.Dir(snapshotPath), "containers.json")
+	_, err := parseFirefoxContainers(filepath.Join(filepath.Dir(snapshotPath), "containers.json"))
+	return err == nil
+}
+
+// firefoxContainerLabels names the four built-in containers. Firefox stores
+// them as a localization identifier and translates them when it runs, so these
+// English labels are the fallback, exactly as kooky does.
+var firefoxContainerLabels = map[string]string{
+	"user-context-personal": "Personal",
+	"user-context-work":     "Work",
+	"user-context-banking":  "Banking",
+	"user-context-shopping": "Shopping",
+}
+
+// firefoxContainerNames reads the container names of one Firefox profile. It
+// gives no names for another browser and no names when the metadata is absent
+// or damaged, and the container number is then the name.
+func firefoxContainerNames(browser, path string) map[int]string {
+	if !strings.EqualFold(browser, "firefox") {
+		return nil
+	}
+	names, err := parseFirefoxContainers(filepath.Join(filepath.Dir(path), "containers.json"))
+	if err != nil {
+		return nil
+	}
+	return names
+}
+
+func parseFirefoxContainers(filename string) (map[int]string, error) {
 	info, err := os.Stat(filename)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("firefox container metadata is not a regular file")
 	}
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	var metadata struct {
 		Identities []struct {
-			UserContextID int `json:"userContextId"`
+			L10nID        *string `json:"l10nID"`
+			Name          *string `json:"name"`
+			UserContextID int     `json:"userContextId"`
 		} `json:"identities"`
 	}
-	return json.Unmarshal(data, &metadata) == nil
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, err
+	}
+	names := make(map[int]string, len(metadata.Identities))
+	for _, identity := range metadata.Identities {
+		var name string
+		// Firefox keeps its own hidden containers in the same list.
+		if identity.Name != nil && !strings.HasPrefix(*identity.Name, "userContextIdInternal.") {
+			name = *identity.Name
+		}
+		if name == "" && identity.L10nID != nil {
+			name = firefoxContainerLabels[*identity.L10nID]
+		}
+		if name != "" {
+			names[identity.UserContextID] = name
+		}
+	}
+	return names, nil
 }
 
 func openInspectionDatabase(filename string) (*sqlite3.Conn, error) {
@@ -537,13 +977,32 @@ func collectStores(ctx context.Context, sequence kooky.CookieStoreSeq) ([]kooky.
 }
 
 type storeCandidate struct {
-	store kooky.CookieStore
-	key   string
-	rank  int
-	path  string
+	store     kooky.CookieStore
+	key       string
+	rank      int
+	path      string
+	isDefault bool
 }
 
-func selectStore(selector Selector, stores []kooky.CookieStore) (kooky.CookieStore, error) {
+// candidateEvidence holds what one scan found in one candidate. It holds no
+// cookie value and no path outside the package.
+type candidateEvidence struct {
+	candidate storeCandidate
+	container string
+	score     cookieScore
+	modified  time.Time
+	err       error
+}
+
+// storeSelection names the selected store and keeps the evidence of every
+// candidate, so that the caller can report the choice.
+type storeSelection struct {
+	store    kooky.CookieStore
+	evidence candidateEvidence
+	scanned  []candidateEvidence
+}
+
+func selectStore(selector Selector, stores []kooky.CookieStore) (storeSelection, error) {
 	groups := make(map[string][]storeCandidate)
 	for _, store := range stores {
 		candidate, ok := makeStoreCandidate(selector, store)
@@ -554,84 +1013,164 @@ func selectStore(selector Selector, stores []kooky.CookieStore) (kooky.CookieSto
 	}
 	if len(groups) == 0 {
 		if selector.hasProfile {
-			return nil, fmt.Errorf("no %s cookie store matched the selected profile; check the profile name", selector.Browser)
+			return storeSelection{}, fmt.Errorf("no %s cookie store matched the selected profile; check the profile name", browserLabel(selector))
 		}
-		return nil, fmt.Errorf("no %s cookie store has a usable default profile; specify one with %s:PROFILE", selector.Browser, selector.Browser)
+		return storeSelection{}, fmt.Errorf("no %s cookie store was found; sign in to Pixieset in a supported browser and retry", browserLabel(selector))
 	}
-	if len(groups) > 1 {
-		return nil, fmt.Errorf("multiple %s cookie stores matched; specify one profile with %s:PROFILE", selector.Browser, selector.Browser)
+	candidates := make([]storeCandidate, 0, len(groups))
+	for _, group := range groups {
+		best, ok := preferredStore(group)
+		if !ok {
+			// The profile keeps two cookie files of equal age. Drop it and let
+			// the other profiles answer, because one strange profile must not
+			// stop the whole search.
+			continue
+		}
+		candidates = append(candidates, best)
 	}
+	if len(candidates) == 0 {
+		return storeSelection{}, fmt.Errorf("no %s cookie store could be read; name one profile with BROWSER:PROFILE", browserLabel(selector))
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].path < candidates[j].path })
+	// Every candidate is scanned, including a single one, so that the reported
+	// evidence is always true.
+	return scanCandidates(candidates), nil
+}
 
-	var group []storeCandidate
-	for _, candidates := range groups {
-		group = candidates
+// browserLabel names the selected browser for a message. It stays empty-safe,
+// because the selector does not always name a browser.
+func browserLabel(selector Selector) string {
+	if selector.hasBrowser() {
+		return selector.Browser
 	}
-	bestRank := group[0].rank
+	return "browser"
+}
+
+// preferredStore keeps one store for each profile. Chromium moved its cookies
+// from the profile directory to the Network subdirectory and can leave both
+// files in place, so the newer path wins. It returns false when two files of
+// equal age make the choice unclear.
+func preferredStore(group []storeCandidate) (storeCandidate, bool) {
+	best := group[0]
 	for _, candidate := range group[1:] {
-		if candidate.rank < bestRank {
-			bestRank = candidate.rank
+		if candidate.rank < best.rank || (candidate.rank == best.rank && candidate.path < best.path) {
+			best = candidate
 		}
 	}
-	best := make([]storeCandidate, 0, len(group))
-	paths := make(map[string]struct{})
 	for _, candidate := range group {
-		if candidate.rank == bestRank {
-			best = append(best, candidate)
-			paths[candidate.path] = struct{}{}
+		if candidate.rank == best.rank && candidate.path != best.path {
+			return storeCandidate{}, false
 		}
 	}
-	if len(paths) > 1 {
-		return nil, fmt.Errorf("multiple %s cookie stores matched; specify one profile with %s:PROFILE", selector.Browser, selector.Browser)
+	return best, true
+}
+
+// scanCandidates reads the evidence of every candidate and keeps the strongest
+// one. The scan reads no cookie value.
+func scanCandidates(candidates []storeCandidate) storeSelection {
+	scanned := make([]candidateEvidence, 0, len(candidates))
+	for _, candidate := range candidates {
+		scanned = append(scanned, inspectStoreCandidate(candidate))
 	}
-	sort.Slice(best, func(i, j int) bool { return best[i].path < best[j].path })
-	return best[0].store, nil
+	best := 0
+	for index := 1; index < len(scanned); index++ {
+		if betterEvidence(scanned[index], scanned[best]) {
+			best = index
+		}
+	}
+	return storeSelection{store: scanned[best].candidate.store, evidence: scanned[best], scanned: scanned}
+}
+
+func inspectStoreCandidate(candidate storeCandidate) candidateEvidence {
+	evidence := candidateEvidence{candidate: candidate}
+	if info, err := os.Stat(candidate.path); err == nil {
+		evidence.modified = info.ModTime()
+	}
+	groups, err := inspectCandidate(candidate.store.Browser(), candidate.path)
+	if err != nil {
+		evidence.err = err
+		return evidence
+	}
+	evidence.container, evidence.score = groups.best()
+	return evidence
+}
+
+// betterEvidence compares two candidates. The score decides first. A tie keeps
+// the store that changed last, then a group with no container, then the default
+// profile, then the first path in alphabetical order.
+func betterEvidence(evidence, other candidateEvidence) bool {
+	if result := evidence.score.compare(other.score); result != 0 {
+		return result > 0
+	}
+	// A store that holds no Pixieset cookie gives no useful time, so the stable
+	// rules below decide instead.
+	if !evidence.score.empty() && !other.score.empty() && !evidence.modified.Equal(other.modified) {
+		return evidence.modified.After(other.modified)
+	}
+	if (evidence.container == "") != (other.container == "") {
+		return evidence.container == ""
+	}
+	if evidence.candidate.isDefault != other.candidate.isDefault {
+		return evidence.candidate.isDefault
+	}
+	return evidence.candidate.path < other.candidate.path
+}
+
+// matchesProfile compares the selected profile with one store. A profile that
+// holds a path separator names a directory or a file. Every other profile is a
+// profile name, as the browser shows it.
+func matchesProfile(selector Selector, store kooky.CookieStore, path string) bool {
+	if !selector.profileIsPath {
+		return store.Profile() == selector.Profile
+	}
+	want := filepath.Clean(selector.Profile)
+	if want == filepath.Clean(path) || want == filepath.Clean(filepath.Dir(path)) {
+		return true
+	}
+	// Chromium keeps its cookies in a Network subdirectory, so the profile
+	// directory is one level higher than the file.
+	if profileDir, _, ok := chromiumProfileDirectory(path); ok {
+		return want == filepath.Clean(profileDir)
+	}
+	return false
 }
 
 func makeStoreCandidate(selector Selector, store kooky.CookieStore) (storeCandidate, bool) {
-	if isNilStore(store) || !strings.EqualFold(store.Browser(), selector.Browser) {
+	if isNilStore(store) {
+		return storeCandidate{}, false
+	}
+	// An empty browser in the selector searches every supported browser.
+	if selector.hasBrowser() && !strings.EqualFold(store.Browser(), selector.Browser) {
 		return storeCandidate{}, false
 	}
 	path := store.FilePath()
 	if !isRegularFile(path) {
 		return storeCandidate{}, false
 	}
+	if selector.hasProfile && !matchesProfile(selector, store, path) {
+		return storeCandidate{}, false
+	}
 	candidate := storeCandidate{store: store, path: filepath.Clean(path), rank: 0}
-	switch strings.ToLower(selector.Browser) {
+	switch strings.ToLower(store.Browser()) {
 	case "brave", "chrome", "chromium", "edge":
 		profileDir, rank, ok := chromiumProfileDirectory(path)
 		if !ok {
 			return storeCandidate{}, false
 		}
-		if selector.hasProfile {
-			if store.Profile() != selector.Profile {
-				return storeCandidate{}, false
-			}
-		} else if filepath.Base(profileDir) != "Default" {
-			return storeCandidate{}, false
-		}
 		candidate.key = filepath.Clean(profileDir)
 		candidate.rank = rank
+		// Chromium names the directory of its first profile "Default". kooky can
+		// mark another profile as the default one, so the directory decides.
+		candidate.isDefault = filepath.Base(profileDir) == "Default"
 	case "firefox":
 		if filepath.Base(path) != "cookies.sqlite" {
 			return storeCandidate{}, false
 		}
-		if selector.hasProfile {
-			if store.Profile() != selector.Profile {
-				return storeCandidate{}, false
-			}
-		} else if !store.IsDefaultProfile() {
-			return storeCandidate{}, false
-		}
 		candidate.key = filepath.Clean(filepath.Dir(path))
+		candidate.isDefault = store.IsDefaultProfile()
 	case "safari":
-		if selector.hasProfile {
-			if store.Profile() != selector.Profile {
-				return storeCandidate{}, false
-			}
-		} else if !store.IsDefaultProfile() {
-			return storeCandidate{}, false
-		}
 		candidate.key = candidate.path
+		candidate.isDefault = store.IsDefaultProfile()
 	default:
 		return storeCandidate{}, false
 	}
@@ -658,7 +1197,11 @@ func isPixiesetCookie(cookie *kooky.Cookie) bool {
 	if cookie == nil || cookie.MaxAge < 0 || cookie.Partitioned {
 		return false
 	}
-	switch strings.ToLower(cookie.Domain) {
+	return isPixiesetHost(cookie.Domain)
+}
+
+func isPixiesetHost(host string) bool {
+	switch strings.ToLower(host) {
 	case ".pixieset.com", ".galleries.pixieset.com", galleriesURL.Host:
 		return true
 	default:
@@ -666,19 +1209,27 @@ func isPixiesetCookie(cookie *kooky.Cookie) bool {
 	}
 }
 
+// matchesContainer accepts every container when the user names none, because
+// the score then selects one container. The name "none" keeps its meaning of
+// "no container". A named container also applies when the selector names no
+// browser, because only Firefox then gives a cookie a container.
 func matchesContainer(selector Selector, cookie *kooky.Cookie) bool {
-	if !strings.EqualFold(selector.Browser, "firefox") {
+	if !selector.hasContainer {
 		return true
 	}
 	if cookie == nil {
 		return false
 	}
-	if !selector.hasContainer || strings.EqualFold(selector.Container, "none") {
+	if strings.EqualFold(selector.Container, "none") {
 		return cookie.Container == ""
 	}
 	return cookie.Container == selector.Container
 }
 
+// cookieFilters runs before the store decrypts a value, so a cookie of another
+// domain never reaches the macOS Keychain. matchesContainer removes a container
+// cookie only when the user names a container, so every container reaches the
+// score.
 func cookieFilters(selector Selector) []kooky.Filter {
 	return []kooky.Filter{
 		kooky.FilterFunc(func(cookie *kooky.Cookie) bool {

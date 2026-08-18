@@ -24,9 +24,7 @@ You need:
 To save files on your computer:
 
 ```sh
-pixiegrabber \
-  --cookies-from-browser 'firefox[:PROFILE][::CONTAINER]' \
-  --output ./references
+pixiegrabber --output ./references
 ```
 
 To save files in an S3-compatible bucket:
@@ -35,19 +33,37 @@ To save files in an S3-compatible bucket:
 export PIXIEGRABBER_S3_ACCESS_KEY=...
 export PIXIEGRABBER_S3_SECRET_KEY=...
 pixiegrabber \
-  --cookies-from-browser 'firefox[:PROFILE][::CONTAINER]' \
   --s3 \
   --s3-endpoint localhost:9000 \
   --s3-bucket references
 ```
 
+Pixiegrabber finds your Pixieset session for you. It looks in each supported browser, and it selects the profile and the Firefox container that hold the session. You do not have to close the browser first.
+
+Pixiegrabber prints its choice, and the value that selects it again:
+
+```
+Using chrome profile "Your Chrome" (5 session cookies, 19 Pixieset cookies).
+Override with --cookies-from-browser 'chrome:Your Chrome'.
+```
+
+If it finds no session, it lists each profile that it examined:
+
+```
+no valid Pixieset cookies found; sign in to Pixieset and retry
+  chrome:Your Chrome — 0 Pixieset cookies
+  firefox:default-release — 3 Pixieset cookies, no session cookie
+```
+
+Copy one of those names into `--cookies-from-browser` to select that profile.
+
 ### Required flags
 
-- `--cookies-from-browser BROWSER[:PROFILE][::CONTAINER]` imports your Pixieset session from a browser. If you specify only the browser, Pixiegrabber uses its default profile.
 - `--output DIR` sets the output directory. You must use this flag unless you use `--s3`.
 
 ### Optional flags
 
+- `--cookies-from-browser [BROWSER[:PROFILE][::CONTAINER]]` limits the search for your Pixieset session. Use `chrome` to search one browser. Use `chrome:Profile 1` to select one profile, by name or by directory path. Use `firefox:default-release::Work` to select one Firefox container. Use `::none` for cookies that belong to no container.
 - `--sync-existing` checks completed Collections again. It records Collections, Sets, References, and Placements that are no longer in Pixieset. It does not delete saved files.
 - `--verify` checks each Placement against its saved SHA-256 checksum. Pixiegrabber downloads a file again if the file is missing or has changed.
 - `--yes` accepts the download plan without a prompt.

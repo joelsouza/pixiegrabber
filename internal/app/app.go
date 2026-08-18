@@ -67,6 +67,21 @@ type collectionPlan struct {
 	plan       archive.Plan
 }
 
+// reportCookieSource names the browser profile that gave the session, and the
+// value that selects it again. It prints counts only, never a cookie value.
+func reportCookieSource(stdout io.Writer, session browsercookies.Session) {
+	source := fmt.Sprintf("%s profile %q", session.Browser, session.Profile)
+	if session.Container != "" {
+		source += fmt.Sprintf(" container %q", session.Container)
+	}
+	fmt.Fprintf(stdout, "Using %s (%d session cookies, %d Pixieset cookies).\n",
+		source, session.SessionCookies, session.Cookies)
+	fmt.Fprintf(stdout, "Override with --cookies-from-browser '%s'.\n", session.Selector())
+	if session.TokenCookies == 0 {
+		fmt.Fprintln(stdout, "This profile has no Pixieset request token. Sign in to Pixieset again if the run fails.")
+	}
+}
+
 // Run executes the CLI flow. stdout receives the plan and progress; stdin
 // provides the confirmation answer. It returns an error for any failure.
 func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader) error {
@@ -83,9 +98,6 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 	} else if options.Output == "" {
 		return errors.New("output directory is required")
 	}
-	if options.CookiesFromBrowser == "" {
-		return errors.New("cookies-from-browser is required")
-	}
 	concurrency := options.Concurrency
 	if concurrency == 0 {
 		concurrency = defaultConcurrency
@@ -101,6 +113,7 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		if err != nil {
 			return err
 		}
+		reportCookieSource(stdout, session)
 	}
 	userAgent := options.UserAgent
 	if userAgent == "" {

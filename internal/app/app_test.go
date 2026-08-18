@@ -23,6 +23,50 @@ import (
 	"pixiegrabber/internal/outputfs"
 )
 
+func TestReportCookieSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		session browsercookies.Session
+		want    []string
+		absent  []string
+	}{
+		{
+			name:    "profile only",
+			session: browsercookies.Session{Browser: "chrome", Profile: "Your Chrome", SessionCookies: 5, TokenCookies: 1, Cookies: 19},
+			want: []string{
+				`Using chrome profile "Your Chrome" (5 session cookies, 19 Pixieset cookies).`,
+				`Override with --cookies-from-browser 'chrome:Your Chrome'.`,
+			},
+			absent: []string{"Sign in to Pixieset again"},
+		},
+		{
+			name:    "container and no token",
+			session: browsercookies.Session{Browser: "firefox", Profile: "default-release", Container: "Work", SessionCookies: 2, Cookies: 4},
+			want: []string{
+				`container "Work"`,
+				`Override with --cookies-from-browser 'firefox:default-release::Work'.`,
+				"Sign in to Pixieset again",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			reportCookieSource(&out, tt.session)
+			for _, want := range tt.want {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("output %q does not contain %q", out.String(), want)
+				}
+			}
+			for _, absent := range tt.absent {
+				if strings.Contains(out.String(), absent) {
+					t.Fatalf("output %q contains %q", out.String(), absent)
+				}
+			}
+		})
+	}
+}
+
 var syntheticJPEG = func() []byte {
 	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	img.Set(0, 0, color.RGBA{R: 255, G: 0, B: 0, A: 255})

@@ -39,9 +39,7 @@ The first version does not accept Collection URLs, filter Collections, download 
 ## Command
 
 ```sh
-pixiegrabber \
-  --cookies-from-browser 'firefox[:PROFILE][::CONTAINER]' \
-  --output ./references
+pixiegrabber --output ./references
 ```
 
 S3 mode:
@@ -50,7 +48,6 @@ S3 mode:
 export PIXIEGRABBER_S3_ACCESS_KEY=...
 export PIXIEGRABBER_S3_SECRET_KEY=...
 pixiegrabber \
-  --cookies-from-browser 'firefox[:PROFILE][::CONTAINER]' \
   --s3 \
   --s3-endpoint localhost:9000 \
   --s3-bucket references
@@ -58,11 +55,11 @@ pixiegrabber \
 
 Required flags:
 
-- `--cookies-from-browser BROWSER[:PROFILE][::CONTAINER]`: Import the active Pixieset session. A browser name alone selects its default profile.
 - `--output DIR`: Select the local output root. Required unless `--s3` is set.
 
 Optional flags:
 
+- `--cookies-from-browser [BROWSER[:PROFILE][::CONTAINER]]`: Import the active Pixieset session. With no flag, Pixiegrabber searches every supported browser. A browser name alone selects the profile and the Firefox container that hold the active session. PROFILE accepts a profile name or a directory path.
 - `--sync-existing`: Refresh completed Collections and represent remote removals without deleting local files.
 - `--verify`: Check every local Placement against its saved SHA-256 checksum and restore missing or changed files.
 - `--yes`: Accept the download plan without an interactive prompt.
@@ -102,16 +99,17 @@ Only documented normalized fields cross from `internal/pixieset` into the manife
 ## Run Behavior
 
 1. Import cookies from the selected browser without changing its profile.
-2. Detect a matching desktop User-Agent unless the user supplied one.
-3. Discover every dashboard-listing page and deduplicate Collections by Pixieset ID.
-4. Classify Collections as new, incomplete, complete, or missing locally expected files.
-5. Load every Set in every selected Collection to build a complete plan before starting any image worker.
-6. If a non-empty `videos` array appears, write one sanitized sample to `<output>/pixiegrabber-unsupported-video.json` and exit nonzero before image downloads.
-7. Show planned Collection, image Reference, Placement file, and source-byte counts. Require confirmation unless `--yes` is present.
-8. Process new and incomplete Collections. Restore missing local files. Skip other completed Collections unless `--sync-existing` is present.
-9. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`. When `--interval` is set, wait at least that long between every Pixieset API call.
-10. Persist resumable manifest state with atomic writes.
-11. Exit nonzero when authentication, discovery, or any Reference fails.
+2. Select the profile and container that hold the most complete Pixieset session, then print the selection and the value that selects it again. Rank each profile by its session cookies, then by its request tokens, then by its total Pixieset cookies. Read only cookie names and hosts during the search, so that one search decrypts one profile.
+3. Detect a matching desktop User-Agent unless the user supplied one.
+4. Discover every dashboard-listing page and deduplicate Collections by Pixieset ID.
+5. Classify Collections as new, incomplete, complete, or missing locally expected files.
+6. Load every Set in every selected Collection to build a complete plan before starting any image worker.
+7. If a non-empty `videos` array appears, write one sanitized sample to `<output>/pixiegrabber-unsupported-video.json` and exit nonzero before image downloads.
+8. Show planned Collection, image Reference, Placement file, and source-byte counts. Require confirmation unless `--yes` is present.
+9. Process new and incomplete Collections. Restore missing local files. Skip other completed Collections unless `--sync-existing` is present.
+10. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`. When `--interval` is set, wait at least that long between every Pixieset API call.
+11. Persist resumable manifest state with atomic writes.
+12. Exit nonzero when authentication, discovery, or any Reference fails.
 
 An empty Collection gets a manifest and a completed state.
 

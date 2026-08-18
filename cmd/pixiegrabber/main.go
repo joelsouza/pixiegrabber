@@ -19,7 +19,7 @@ func main() {
 		os.Exit(1)
 	}
 	var options app.Options
-	flag.StringVar(&options.CookiesFromBrowser, "cookies-from-browser", "", "import the active Pixieset session from BROWSER[:PROFILE][::CONTAINER]")
+	flag.StringVar(&options.CookiesFromBrowser, "cookies-from-browser", "", "import the active Pixieset session; give [BROWSER[:PROFILE][::CONTAINER]] to limit the search")
 	flag.StringVar(&options.Output, "output", "", "select the local output root (required unless --s3)")
 	flag.BoolVar(&options.SyncExisting, "sync-existing", false, "refresh completed Collections and represent remote removals without deleting local files")
 	flag.BoolVar(&options.Verify, "verify", false, "check every local Placement against its saved SHA-256 checksum and restore missing or changed files")

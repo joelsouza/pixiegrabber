@@ -10,7 +10,11 @@ func TestParseSelector(t *testing.T) {
 		input string
 		want  Selector
 	}{
+		{input: "", want: Selector{}},
+		{input: "   ", want: Selector{}},
 		{input: "chrome", want: Selector{Browser: "chrome"}},
+		{input: "::Work", want: Selector{Container: "Work", hasContainer: true}},
+		{input: "firefox:/tmp/profiles/work", want: Selector{Browser: "firefox", Profile: "/tmp/profiles/work", hasProfile: true, profileIsPath: true}},
 		{input: "Brave:Profile 2", want: Selector{Browser: "brave", Profile: "Profile 2", hasProfile: true}},
 		{input: "firefox::Personal", want: Selector{Browser: "firefox", Container: "Personal", hasContainer: true}},
 		{input: "firefox:default-release::none", want: Selector{Browser: "firefox", Profile: "default-release", Container: "none", hasProfile: true, hasContainer: true}},
@@ -28,8 +32,26 @@ func TestParseSelector(t *testing.T) {
 	}
 }
 
+// An absent flag arrives as an empty value, which must search every browser
+// instead of stopping the run.
+func TestParseSelectorWithoutAValueSearchesEveryBrowser(t *testing.T) {
+	selector, err := ParseSelector("")
+	if err != nil {
+		t.Fatalf("ParseSelector(%q) error = %v", "", err)
+	}
+	if selector != (Selector{}) {
+		t.Fatalf("ParseSelector(%q) = %#v, want an empty selector", "", selector)
+	}
+	if selector.hasBrowser() {
+		t.Fatal("an empty selector names a browser")
+	}
+	if !(Selector{Browser: "chrome"}).hasBrowser() {
+		t.Fatal("a named browser was not reported")
+	}
+}
+
 func TestParseSelectorRejectsInvalidValues(t *testing.T) {
-	for _, input := range []string{"", "unknown", "chrome:", "chrome::container", "firefox:::container", "firefox:profile::", "firefox:one::two::three", "firefox:\nprofile"} {
+	for _, input := range []string{"unknown", "chrome:", ":profile", "chrome::container", "firefox:::container", "firefox:profile::", "firefox:one::two::three", "firefox:\nprofile"} {
 		t.Run(input, func(t *testing.T) {
 			if _, err := ParseSelector(input); err == nil {
 				t.Fatalf("ParseSelector(%q) succeeded", input)

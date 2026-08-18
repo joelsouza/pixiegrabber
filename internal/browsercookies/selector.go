@@ -3,6 +3,7 @@ package browsercookies
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"unicode"
 )
@@ -19,23 +20,30 @@ var supportedBrowsers = map[string]struct{}{
 }
 
 // Selector identifies one browser profile and an optional Firefox container.
+// Each part is optional. An empty selector selects every supported browser.
 type Selector struct {
 	Browser   string
 	Profile   string
 	Container string
 
-	hasProfile   bool
-	hasContainer bool
+	hasProfile    bool
+	hasContainer  bool
+	profileIsPath bool
 }
 
-// ParseSelector parses BROWSER[:PROFILE][::CONTAINER].
+// hasBrowser reports whether the selector names one browser. An empty name
+// searches every supported browser.
+func (s Selector) hasBrowser() bool { return s.Browser != "" }
+
+// ParseSelector parses [BROWSER][:PROFILE][::CONTAINER]. An empty value gives
+// an empty selector, which searches every supported browser.
 func ParseSelector(value string) (Selector, error) {
 	if len(value) > maxSelectorBytes || hasControl(value) {
 		return Selector{}, errors.New("browser selector is invalid; remove control characters or shorten it")
 	}
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return Selector{}, errors.New("browser selector is required; use BROWSER[:PROFILE][::CONTAINER]")
+		return Selector{}, nil
 	}
 
 	selector := Selector{}
@@ -57,17 +65,27 @@ func ParseSelector(value string) (Selector, error) {
 		return Selector{}, errors.New("browser profile is invalid; provide one profile name")
 	}
 	selector.Browser = strings.ToLower(strings.TrimSpace(browser))
-	if _, supported := supportedBrowsers[selector.Browser]; !supported {
+	if selector.Browser == "" {
+		// A profile belongs to one browser, so it needs a browser name.
+		if hasProfile {
+			return Selector{}, errors.New("browser name is required before a profile; use BROWSER:PROFILE")
+		}
+	} else if _, supported := supportedBrowsers[selector.Browser]; !supported {
 		return Selector{}, fmt.Errorf("browser %q is not supported; use brave, chrome, chromium, edge, firefox, or safari", selector.Browser)
 	}
 	if hasProfile {
 		selector.Profile = strings.TrimSpace(profile)
 		if selector.Profile == "" {
-			return Selector{}, errors.New("browser profile is empty; omit the colon to use the default profile")
+			return Selector{}, errors.New("browser profile is empty; omit the colon to search every profile")
 		}
 		selector.hasProfile = true
+		// A profile that holds a path separator names a directory, not a
+		// profile name. yt-dlp accepts the same two forms.
+		selector.profileIsPath = strings.ContainsRune(selector.Profile, os.PathSeparator)
 	}
-	if selector.hasContainer && selector.Browser != "firefox" {
+	// Only Firefox has containers, but that can be checked only when the
+	// selector names a browser.
+	if selector.hasContainer && selector.hasBrowser() && selector.Browser != "firefox" {
 		return Selector{}, errors.New("browser containers are supported only for Firefox")
 	}
 	return selector, nil
