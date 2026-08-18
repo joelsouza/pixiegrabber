@@ -1,23 +1,27 @@
 # Pixiegrabber
 
-Pixiegrabber preserves authorized Pixieset Client Gallery Collections locally or in an S3-compatible bucket. It discovers the Collections in the active Pixieset workspace, downloads each image Reference, and writes one normalized JSON manifest for each Collection.
+Pixiegrabber downloads images from Pixieset Client Gallery Collections that you can access. It stores the images on your computer or in an S3-compatible bucket. It also writes a JSON manifest for each Collection.
 
-## Domain language
+## Terms
 
-- **Collection**: a top-level Pixieset client gallery that contains zero or more Sets.
-- **Set**: a named group of References within a Collection.
-- **Reference**: a Pixieset gallery image preserved locally together with the metadata that identifies and describes its source.
-- **Placement**: the membership of a Reference in a Set. Each Placement has its own local file path, so one Reference can appear in multiple Set folders.
+This README uses the following terms:
+
+- Collection: one Pixieset client gallery. A Collection can contain Sets.
+- Set: a named group of References in a Collection.
+- Reference: an image and the metadata that describes its source.
+- Placement: the location of a Reference in a Set. One Reference can have a Placement in more than one Set.
 
 ## Requirements
 
-- Go 1.25 or newer.
-- An active Pixieset session in a supported browser (Brave, Chrome, Chromium, Edge, Firefox, or Safari).
-- An S3-compatible bucket and credentials when using S3 mode.
+You need:
+
+- Go 1.25 or later.
+- A signed-in Pixieset session in Brave, Chrome, Chromium, Edge, Firefox, or Safari.
+- An S3-compatible bucket and its credentials if you use S3 storage.
 
 ## Usage
 
-Local mode:
+To save files on your computer:
 
 ```sh
 pixiegrabber \
@@ -25,7 +29,7 @@ pixiegrabber \
   --output ./references
 ```
 
-S3 mode:
+To save files in an S3-compatible bucket:
 
 ```sh
 export PIXIEGRABBER_S3_ACCESS_KEY=...
@@ -39,25 +43,27 @@ pixiegrabber \
 
 ### Required flags
 
-- `--cookies-from-browser BROWSER[:PROFILE][::CONTAINER]`: import the active Pixieset session. A browser name alone selects its default profile.
-- `--output DIR`: select the local output root. Required unless `--s3` is set.
+- `--cookies-from-browser BROWSER[:PROFILE][::CONTAINER]` imports your Pixieset session from a browser. If you specify only the browser, Pixiegrabber uses its default profile.
+- `--output DIR` sets the output directory. You must use this flag unless you use `--s3`.
 
 ### Optional flags
 
-- `--sync-existing`: refresh completed Collections and represent remote removals without deleting local files.
-- `--verify`: check every Placement against its saved SHA-256 checksum and restore missing or changed files.
-- `--yes`: accept the download plan without an interactive prompt.
-- `--concurrency N`: set concurrent Reference downloads. The default is `4`.
-- `--user-agent VALUE`: override the User-Agent detected from the selected browser and its installed version.
-- `--interval DURATION`: set the minimum interval between Pixieset API calls. The default is `0`, which disables throttling. Use a value such as `2s` to avoid flooding the Pixieset servers.
-- `--s3`: store output in an S3-compatible bucket instead of a local directory.
-- `--s3-endpoint HOST[:PORT]`: the S3-compatible endpoint without a scheme.
-- `--s3-bucket NAME`: the bucket name. The bucket must already exist.
-- `--s3-region REGION`: the region. The default is `us-east-1`.
-- `--s3-path-style`: use path-style addressing. The default is `true`.
-- `--s3-secure`: use HTTPS for the S3 endpoint. The default is `true`.
+- `--sync-existing` checks completed Collections again. It records Collections, Sets, References, and Placements that are no longer in Pixieset. It does not delete saved files.
+- `--verify` checks each Placement against its saved SHA-256 checksum. Pixiegrabber downloads a file again if the file is missing or has changed.
+- `--yes` accepts the download plan without a prompt.
+- `--concurrency N` sets the number of References that Pixiegrabber can download at the same time. The default is `4`.
+- `--user-agent VALUE` sets the User-Agent header. If you do not use this flag, Pixiegrabber gets the value from the selected browser.
+- `--interval DURATION` sets the minimum time between Pixieset API and image requests. The default is `0`, which turns this delay off. Use a value such as `2s` to reduce the request rate.
+- `--s3` stores the output in an S3-compatible bucket.
+- `--s3-endpoint HOST[:PORT]` sets the S3-compatible endpoint without a scheme.
+- `--s3-bucket NAME` sets the bucket name. The bucket must exist before you run Pixiegrabber.
+- `--s3-region REGION` sets the region. The default is `us-east-1`.
+- `--s3-path-style` uses path-style S3 addresses. The default is `true`.
+- `--s3-secure` uses HTTPS for the S3 endpoint. The default is `true`.
 
-## Local layout
+## Local file layout
+
+Pixiegrabber uses this directory structure:
 
 ```text
 <output>/
@@ -67,11 +73,11 @@ pixiegrabber \
       <reference-name>--<media-id>.<extension>
 ```
 
-Only one process may use an output root at a time. The output root is locked, and symbolic-link and reparse-point components are rejected.
+Pixiegrabber locks the output directory while it runs. A second process cannot use the same directory at the same time. Pixiegrabber rejects symbolic links and reparse points in the output path.
 
-## S3 layout
+## S3 object layout
 
-S3 mode mirrors the local layout as object keys:
+Pixiegrabber uses the same names for S3 object keys:
 
 ```text
 <collection-name>--<collection-id>/
@@ -80,15 +86,11 @@ S3 mode mirrors the local layout as object keys:
     <reference-name>--<media-id>.<extension>
 ```
 
-- Read the access key and secret key from `PIXIEGRABBER_S3_ACCESS_KEY` and `PIXIEGRABBER_S3_SECRET_KEY`. Never pass them as flags.
-- The bucket must already exist. Pixiegrabber does not create it.
-- Each object stores its SHA-256 checksum as metadata and in the manifest.
-- A lock object `.pixiegrabber.lock` prevents two processes from using the bucket at once. A stale lock older than 10 minutes is replaced.
-- `--verify` uses the stored checksum metadata when it matches the manifest, and re-downloads otherwise.
-
-## Video stop
-
-Pixiegrabber does not download videos in this version. When a Set contains a non-empty `videos` array, it writes one sanitized value-shaped sample to `<output>/pixiegrabber-unsupported-video.json` (or the bucket root in S3 mode), prints the diagnostic path, and exits nonzero before any image download begins.
+- Set `PIXIEGRABBER_S3_ACCESS_KEY` and `PIXIEGRABBER_S3_SECRET_KEY` before you run Pixiegrabber. Do not put these values in command-line flags.
+- Create the bucket before you run Pixiegrabber. Pixiegrabber does not create it.
+- Pixiegrabber stores the SHA-256 checksum in the object metadata and in the manifest.
+- The `.pixiegrabber.lock` object prevents two processes from using the bucket at the same time. Pixiegrabber replaces this object if it is more than 10 minutes old.
+- With `--verify`, Pixiegrabber uses the checksum in the object metadata when it matches the manifest. Otherwise, Pixiegrabber downloads the file again.
 
 ## Build and test
 
@@ -100,4 +102,4 @@ go vet ./...
 
 ## Security
 
-Pixiegrabber never logs or persists cookies, tokens, signed URL queries, raw API payloads, passwords, PINs, or S3 credentials. It never deletes local Collection, Set, Reference, or Placement data automatically.
+Pixiegrabber does not write cookies, tokens, signed URL queries, raw API responses, passwords, PINs, or S3 credentials to logs or saved files. It does not automatically delete saved Collection, Set, Reference, or Placement data.
