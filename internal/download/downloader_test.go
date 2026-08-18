@@ -29,6 +29,7 @@ import (
 	"pixiegrabber/internal/archive"
 	"pixiegrabber/internal/outputfs"
 	"pixiegrabber/internal/pixieset"
+	"pixiegrabber/internal/throttle"
 )
 
 var syntheticJPEG = func() []byte {
@@ -149,6 +150,38 @@ func assertFailureCode(t *testing.T, result Result, code string) {
 	}
 	if result.Failure.Message == "" {
 		t.Fatal("failure message is empty")
+	}
+}
+
+func TestDownloadThrottleSpacesFetches(t *testing.T) {
+	fs := openTestFS(t)
+	const interval = 30 * time.Millisecond
+	var fetches atomic.Int32
+	d, _ := loopbackDownloader(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}), Options{
+		Concurrency: 1,
+		Limiter:     throttle.New(interval),
+	})
+	work := make([]archive.DownloadWork, 4)
+	for i := range work {
+		id := fmt.Sprintf("ref-%d", i)
+		work[i] = oneWork(id, []pixieset.ImageVariant{{Quality: "large", URL: d.mediaOrigin + "/" + id}}, "Collection--100/Set--11/"+id+".jpg")
+	}
+	start := time.Now()
+	results := d.Download(context.Background(), fs, work)
+	elapsed := time.Since(start)
+	for _, result := range results {
+		assertSuccess(t, result, "large")
+	}
+	if fetches.Load() != int32(len(work)) {
+		t.Fatalf("fetches = %d, want %d", fetches.Load(), len(work))
+	}
+	minExpected := time.Duration(len(work)-1) * interval
+	if elapsed < minExpected {
+		t.Fatalf("elapsed = %v, want at least %v", elapsed, minExpected)
 	}
 }
 
@@ -760,7 +793,7 @@ func TestDownloadRelativeOutputRootAndPreReplacementTargetPreservation(t *testin
 	if err := os.Mkdir(dirTarget, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := installPlacement(fs, stage, archive.Destination{SetID: "11", RelativePath: "Collection--100/Set--11/stage-directory"}); err == nil {
+	if err := installPlacement(fs, stage, 3, "new", archive.Destination{SetID: "11", RelativePath: "Collection--100/Set--11/stage-directory"}); err == nil {
 		t.Fatal("directory staging unexpectedly replaced regular target")
 	}
 	if got := string(mustReadFile(t, preserved)); got != "keep" {

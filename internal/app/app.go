@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -16,9 +17,10 @@ import (
 	"pixiegrabber/internal/browsercookies"
 	"pixiegrabber/internal/download"
 	"pixiegrabber/internal/manifest"
-	"pixiegrabber/internal/outputfs"
 	"pixiegrabber/internal/paths"
 	"pixiegrabber/internal/pixieset"
+	"pixiegrabber/internal/store"
+	"pixiegrabber/internal/throttle"
 )
 
 const (
@@ -36,6 +38,20 @@ type Options struct {
 	Yes                bool
 	Concurrency        int
 	UserAgent          string
+	Interval           time.Duration
+
+	// S3 mode. When S3 is enabled, Output is not required and the store is
+	// backed by an S3-compatible bucket instead of a local directory.
+	S3          bool
+	S3Endpoint  string
+	S3Bucket    string
+	S3Region    string
+	S3PathStyle bool
+	S3Secure    bool
+
+	// Store overrides the backend. When nil, Run selects local or S3 based on
+	// the S3 flag. It is a test seam.
+	Store store.Store
 
 	// apiBaseURL and mediaOrigin are unexported test seams. apiBaseURL
 	// defaults to the production API origin; mediaOrigin defaults to the
@@ -54,7 +70,17 @@ type collectionPlan struct {
 // Run executes the CLI flow. stdout receives the plan and progress; stdin
 // provides the confirmation answer. It returns an error for any failure.
 func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader) error {
-	if options.Output == "" {
+	if options.S3 {
+		if options.S3Endpoint == "" {
+			return errors.New("s3-endpoint is required in s3 mode")
+		}
+		if options.S3Bucket == "" {
+			return errors.New("s3-bucket is required in s3 mode")
+		}
+		if os.Getenv("PIXIEGRABBER_S3_ACCESS_KEY") == "" || os.Getenv("PIXIEGRABBER_S3_SECRET_KEY") == "" {
+			return errors.New("PIXIEGRABBER_S3_ACCESS_KEY and PIXIEGRABBER_S3_SECRET_KEY are required in s3 mode")
+		}
+	} else if options.Output == "" {
 		return errors.New("output directory is required")
 	}
 	if options.CookiesFromBrowser == "" {
@@ -84,17 +110,23 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		return errors.New("a User-Agent is required; set --user-agent or import a browser session")
 	}
 
-	fs, err := outputfs.Open(options.Output)
+	s, err := selectStore(options)
 	if err != nil {
 		return err
 	}
-	defer fs.Close()
+	defer s.Close()
+	release, err := s.Lock()
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	apiBase := options.apiBaseURL
 	if apiBase == "" {
 		apiBase = productionAPIBase
 	}
-	client, err := pixieset.NewClient(apiBase, &http.Client{Jar: session.Jar}, pixieset.WithUserAgent(userAgent))
+	lim := throttle.New(options.Interval)
+	client, err := pixieset.NewClient(apiBase, &http.Client{Jar: session.Jar}, pixieset.WithUserAgent(userAgent), pixieset.WithThrottle(lim))
 	if err != nil {
 		return err
 	}
@@ -120,7 +152,7 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			}
 			fullSets = append(fullSets, full)
 		}
-		if err := archive.CheckVideos(fs, fullSets); err != nil {
+		if err := archive.CheckVideos(s, fullSets); err != nil {
 			if errors.Is(err, archive.ErrUnsupportedVideo) {
 				var videoErr *archive.UnsupportedVideoError
 				if errors.As(err, &videoErr) {
@@ -129,11 +161,11 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			}
 			return err
 		}
-		previous, err := loadPreviousManifest(fs, collection)
+		previous, err := loadPreviousManifest(s, collection)
 		if err != nil {
 			return err
 		}
-		plan, err := archive.Build(fs, collection, fullSets, previous, archive.Options{
+		plan, err := archive.Build(s, collection, fullSets, previous, archive.Options{
 			SyncExisting: options.SyncExisting,
 			Verify:       options.Verify,
 			Now:          time.Now().UTC(),
@@ -148,7 +180,7 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 	// without deleting any local files.
 	var absent []archive.Plan
 	if options.SyncExisting {
-		entries, err := fs.ReadDir(".")
+		entries, err := s.ReadDir(".")
 		if err != nil {
 			return err
 		}
@@ -163,14 +195,14 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			if _, ok := discovered[id]; ok {
 				continue
 			}
-			previous, err := manifest.Load(fs, path.Join(entry.Name(), manifest.ManifestFilename))
+			previous, err := manifest.Load(s, path.Join(entry.Name(), manifest.ManifestFilename))
 			if err != nil {
 				if errors.Is(err, manifest.ErrNotFound) {
 					continue
 				}
 				return err
 			}
-			plan, err := archive.MarkSourceMissing(fs, *previous, time.Now().UTC())
+			plan, err := archive.MarkSourceMissing(s, *previous, time.Now().UTC())
 			if err != nil {
 				return err
 			}
@@ -194,12 +226,12 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 
 	now := time.Now().UTC()
 	for i := range plans {
-		if err := executePlan(ctx, fs, concurrency, options.mediaOrigin, &plans[i].plan, now); err != nil {
+		if err := executePlan(ctx, s, concurrency, options.mediaOrigin, lim, &plans[i].plan, now); err != nil {
 			return err
 		}
 	}
 	for _, plan := range absent {
-		if err := manifest.Write(fs, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest); err != nil {
+		if err := manifest.Write(s, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest); err != nil {
 			return err
 		}
 	}
@@ -212,6 +244,26 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		}
 	}
 	return nil
+}
+
+// selectStore returns the backend for a run. An explicit Store seam wins;
+// otherwise S3 mode builds an S3 backend and local mode opens the output root.
+func selectStore(options Options) (store.Store, error) {
+	if options.Store != nil {
+		return options.Store, nil
+	}
+	if options.S3 {
+		return store.NewS3(store.Config{
+			Endpoint:  options.S3Endpoint,
+			Bucket:    options.S3Bucket,
+			Region:    options.S3Region,
+			AccessKey: os.Getenv("PIXIEGRABBER_S3_ACCESS_KEY"),
+			SecretKey: os.Getenv("PIXIEGRABBER_S3_SECRET_KEY"),
+			PathStyle: options.S3PathStyle,
+			Secure:    options.S3Secure,
+		})
+	}
+	return store.NewLocal(options.Output)
 }
 
 func displayPlan(stdout io.Writer, plans []collectionPlan) {
@@ -238,16 +290,16 @@ func displayPlan(stdout io.Writer, plans []collectionPlan) {
 	fmt.Fprintf(stdout, "Source bytes: %d\n", sourceBytes)
 }
 
-func loadPreviousManifest(fs *outputfs.FS, collection pixieset.Collection) (*manifest.Manifest, error) {
+func loadPreviousManifest(s store.Store, collection pixieset.Collection) (*manifest.Manifest, error) {
 	currentDir := paths.CollectionComponent(collection.Name, collection.ID)
-	previous, err := manifest.Load(fs, path.Join(currentDir, manifest.ManifestFilename))
+	previous, err := manifest.Load(s, path.Join(currentDir, manifest.ManifestFilename))
 	if err == nil {
 		return previous, nil
 	}
 	if !errors.Is(err, manifest.ErrNotFound) {
 		return nil, err
 	}
-	entries, err := fs.ReadDir(".")
+	entries, err := s.ReadDir(".")
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +308,7 @@ func loadPreviousManifest(fs *outputfs.FS, collection pixieset.Collection) (*man
 		if !entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
 			continue
 		}
-		previous, err := manifest.Load(fs, path.Join(entry.Name(), manifest.ManifestFilename))
+		previous, err := manifest.Load(s, path.Join(entry.Name(), manifest.ManifestFilename))
 		if err == nil {
 			return previous, nil
 		}
@@ -275,9 +327,9 @@ func collectionIDFromDir(name string) string {
 	return name[idx+2:]
 }
 
-func executePlan(ctx context.Context, fs *outputfs.FS, concurrency int, mediaOrigin string, plan *archive.Plan, now time.Time) error {
+func executePlan(ctx context.Context, s store.Store, concurrency int, mediaOrigin string, limiter *throttle.Limiter, plan *archive.Plan, now time.Time) error {
 	for _, rename := range plan.Renames {
-		if err := applyRename(fs, rename); err != nil {
+		if err := applyRename(s, rename); err != nil {
 			return err
 		}
 	}
@@ -286,35 +338,37 @@ func executePlan(ctx context.Context, fs *outputfs.FS, concurrency int, mediaOri
 			Client:      &http.Client{},
 			Concurrency: concurrency,
 			MediaOrigin: mediaOrigin,
+			Limiter:     limiter,
 		})
 		if err != nil {
 			return err
 		}
-		results := downloader.Download(ctx, fs, plan.Downloads)
+		results := downloader.Download(ctx, s, plan.Downloads)
 		applyResults(&plan.Manifest, results, now)
 	}
-	if err := manifest.Write(fs, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest); err != nil {
+	if err := manifest.Write(s, path.Join(plan.CollectionDir, manifest.ManifestFilename), plan.Manifest); err != nil {
 		return err
 	}
 	return nil
 }
 
-func applyRename(fs *outputfs.FS, rename archive.Rename) error {
-	source, err := fs.OpenRegular(rename.From)
+func applyRename(s store.Store, rename archive.Rename) error {
+	source, err := s.Open(rename.From)
 	if err != nil {
 		return err
 	}
 	defer source.Close()
-	if err := fs.AtomicReplace(rename.To, func(w io.Writer) error {
-		if _, err := source.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		_, err := io.Copy(w, source)
-		return err
-	}); err != nil {
+	info, exists, err := s.Inspect(rename.From)
+	if err != nil {
 		return err
 	}
-	return fs.Remove(rename.From)
+	if !exists {
+		return errors.New("rename source is missing")
+	}
+	if err := s.Put(rename.To, source, info.Size(), nil); err != nil {
+		return err
+	}
+	return s.Remove(rename.From)
 }
 
 func applyResults(m *manifest.Manifest, results []download.Result, now time.Time) {

@@ -11,8 +11,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"pixiegrabber/internal/throttle"
 )
 
 func TestClientCapturedContractsHeadersDatesVariantsAndVideos(t *testing.T) {
@@ -558,6 +561,7 @@ func TestClientHTTPBoundsContentTypeAndCauseDoNotLeak(t *testing.T) {
 	}))
 	defer statusServer.Close()
 	client, _ := NewClient(statusServer.URL, statusServer.Client(), WithUserAgent("test"))
+	client.sleep = func(context.Context, time.Duration) error { return nil }
 	_, err := client.ListCollections(context.Background())
 	var httpErr *HTTPError
 	if err == nil || !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadGateway || strings.Contains(err.Error(), secret) {
@@ -594,6 +598,85 @@ func TestClientHTTPBoundsContentTypeAndCauseDoNotLeak(t *testing.T) {
 	_, err = client.ListCollections(context.Background())
 	if !errors.Is(err, transportErr) {
 		t.Fatalf("transport cause was lost: %v", err)
+	}
+}
+
+func TestClientThrottleSpacesSequentialRequests(t *testing.T) {
+	const interval = 30 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"), WithThrottle(throttle.New(interval)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 5
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if _, err := client.GetSet(context.Background(), "1", "2"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	minExpected := time.Duration(n-1) * interval
+	if elapsed < minExpected {
+		t.Fatalf("elapsed = %v, want at least %v", elapsed, minExpected)
+	}
+}
+
+func TestClientThrottleZeroIntervalDoesNotSlow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"), WithThrottle(throttle.New(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 20
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if _, err := client.GetSet(context.Background(), "1", "2"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("zero interval slowed requests: %v", elapsed)
+	}
+}
+
+func TestClientRetries429HonoringRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotDelay time.Duration
+	client.sleep = func(ctx context.Context, delay time.Duration) error {
+		gotDelay = delay
+		return nil
+	}
+	if _, err := client.GetSet(context.Background(), "1", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+	if gotDelay != 2*time.Second {
+		t.Fatalf("retry delay = %v, want 2s", gotDelay)
 	}
 }
 

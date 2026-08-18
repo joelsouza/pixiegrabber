@@ -2,13 +2,14 @@
 
 ## Objective
 
-Pixiegrabber is a local command-line tool that preserves authorized Pixieset Client Gallery Collections. It discovers Collections in the active Pixieset workspace, downloads each image Reference, and writes one normalized JSON manifest for each Collection.
+Pixiegrabber is a command-line tool that preserves authorized Pixieset Client Gallery Collections. It discovers Collections in the active Pixieset workspace, downloads each image Reference, and writes one normalized JSON manifest for each Collection. It stores output in a local directory or in an S3-compatible bucket.
 
 The first version processes new and incomplete Collections by default. It can safely synchronize completed Collections without deleting local files.
 
 ## Scope
 
 - Use the active workspace from an imported browser session.
+- Store output in a local directory or in an S3-compatible bucket.
 - Discover all pages from Pixieset's dashboard listings endpoint.
 - Ignore Pixieset dashboard folders.
 - Process all Sets and image References in each selected Collection.
@@ -30,6 +31,8 @@ The first version does not accept Collection URLs, filter Collections, download 
 - Browser cookie dependency: [`github.com/browserutils/kooky` `v0.2.10`](https://github.com/browserutils/kooky/releases/tag/v0.2.10), pinned behind `internal/browsercookies` because its API is not stable.
 - Output locking dependency: [`github.com/gofrs/flock` `v0.13.0`](https://github.com/gofrs/flock/releases/tag/v0.13.0).
 - Extended image decoder dependency: [`golang.org/x/image` `v0.44.0`](https://pkg.go.dev/golang.org/x/image@v0.44.0).
+- S3-compatible storage dependency: [`github.com/minio/minio-go/v7`](https://github.com/minio/minio-go).
+- Rate limiting dependency: [`golang.org/x/time`](https://pkg.go.dev/golang.org/x/time).
 - Use popular, actively maintained Go libraries for common functions when they make implementation simpler or faster. Prefer them over custom code, and write custom infrastructure only when no suitable library meets the required behavior.
 - The selected browser can remain open while Pixiegrabber reads cookies from a safe temporary copy of its profile data.
 
@@ -41,10 +44,22 @@ pixiegrabber \
   --output ./references
 ```
 
+S3 mode:
+
+```sh
+export PIXIEGRABBER_S3_ACCESS_KEY=...
+export PIXIEGRABBER_S3_SECRET_KEY=...
+pixiegrabber \
+  --cookies-from-browser 'firefox[:PROFILE][::CONTAINER]' \
+  --s3 \
+  --s3-endpoint localhost:9000 \
+  --s3-bucket references
+```
+
 Required flags:
 
 - `--cookies-from-browser BROWSER[:PROFILE][::CONTAINER]`: Import the active Pixieset session. A browser name alone selects its default profile.
-- `--output DIR`: Select the local output root. Pixiegrabber has no implicit output directory.
+- `--output DIR`: Select the local output root. Required unless `--s3` is set.
 
 Optional flags:
 
@@ -53,6 +68,13 @@ Optional flags:
 - `--yes`: Accept the download plan without an interactive prompt.
 - `--concurrency N`: Set concurrent Reference downloads. The default is `4`.
 - `--user-agent VALUE`: Override the User-Agent detected from the selected browser and its installed version.
+- `--interval DURATION`: Set the minimum interval between Pixieset API calls. The default is `0`, which disables throttling. Use a value such as `2s` to avoid flooding the Pixieset servers.
+- `--s3`: Store output in an S3-compatible bucket instead of a local directory.
+- `--s3-endpoint HOST[:PORT]`: The S3-compatible endpoint without a scheme.
+- `--s3-bucket NAME`: The bucket name. The bucket must already exist.
+- `--s3-region REGION`: The region. The default is `us-east-1`.
+- `--s3-path-style`: Use path-style addressing. The default is `true`.
+- `--s3-secure`: Use HTTPS for the S3 endpoint. The default is `true`.
 
 Build and verification commands:
 
@@ -87,7 +109,7 @@ Only documented normalized fields cross from `internal/pixieset` into the manife
 6. If a non-empty `videos` array appears, write one sanitized sample to `<output>/pixiegrabber-unsupported-video.json` and exit nonzero before image downloads.
 7. Show planned Collection, image Reference, Placement file, and source-byte counts. Require confirmation unless `--yes` is present.
 8. Process new and incomplete Collections. Restore missing local files. Skip other completed Collections unless `--sync-existing` is present.
-9. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`.
+9. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`. When `--interval` is set, wait at least that long between every Pixieset API call.
 10. Persist resumable manifest state with atomic writes.
 11. Exit nonzero when authentication, discovery, or any Reference fails.
 
@@ -131,6 +153,24 @@ Names remain readable. Path generation normalizes Unicode and replaces character
 
 Each Collection is self-contained. If the same media appears in two Collections, each Collection stores its own Reference files. If one Reference appears in two Sets of one Collection, each Set stores its own Placement file.
 
+## S3 Mode
+
+S3 mode mirrors the local layout as object keys:
+
+```text
+<collection-name>--<collection-id>/
+  collection.json
+  <set-name>--<set-id>/
+    <reference-name>--<media-id>.<extension>
+```
+
+- Read the access key and secret key from `PIXIEGRABBER_S3_ACCESS_KEY` and `PIXIEGRABBER_S3_SECRET_KEY`. Never pass them as flags or log them.
+- The bucket must already exist. Pixiegrabber does not create it.
+- Each object stores its SHA-256 checksum as metadata and in the manifest.
+- A lock object `.pixiegrabber.lock` prevents two processes from using the bucket at once. A stale lock older than 10 minutes is replaced.
+- `--verify` uses the stored checksum metadata when it matches the manifest, and re-downloads otherwise.
+- The video-stop diagnostic is written to the bucket root in S3 mode.
+
 ## Manifest
 
 Each Collection has one human-readable `collection.json` file with a schema version.
@@ -168,6 +208,8 @@ internal/archive/        Collection classification and synchronization
 internal/download/       Image download execution
 internal/manifest/       Versioned manifest model and atomic persistence
 internal/paths/          Cross-platform readable path generation
+internal/store/          Storage abstraction: local and S3-compatible backends
+internal/throttle/       Polite rate limiting for Pixieset API calls
 internal/testdata/       Sanitized API and media fixtures
 docs/                    Domain, specification, and architecture documents
 ```
@@ -228,6 +270,8 @@ Never:
 - Images use the largest listed quality and preserve every Set Placement.
 - The first video response produces a sanitized diagnostic and stops the run before image downloads.
 - Output follows the documented hierarchy and each Collection has one valid normalized manifest.
+- S3 mode stores References, manifests, and the video-stop diagnostic in the bucket with the documented key layout.
+- `--interval` throttles every Pixieset API call and honors `Retry-After` on 429 responses.
 - A failed Reference does not discard successful work and resumes on the next normal run.
 - A normal run skips healthy completed Collections and restores missing Placement files.
 - `--sync-existing` handles additions, renames, moves, repeated Placements, changed content, and source removals without local deletion.

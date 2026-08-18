@@ -27,7 +27,8 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"pixiegrabber/internal/archive"
-	"pixiegrabber/internal/outputfs"
+	"pixiegrabber/internal/store"
+	"pixiegrabber/internal/throttle"
 )
 
 const (
@@ -108,6 +109,9 @@ type Options struct {
 	Concurrency int
 	MaxAttempts int
 
+	// Limiter spaces out media requests. A nil limiter disables throttling.
+	Limiter *throttle.Limiter
+
 	// MediaOrigin overrides the fixed production media origin. It is a test
 	// seam; production callers leave it empty.
 	MediaOrigin string
@@ -125,6 +129,7 @@ type Downloader struct {
 	concurrency int
 	maxAttempts int
 	mediaOrigin string
+	limiter     *throttle.Limiter
 	sleeper     sleeperFunc
 	clock       func() time.Time
 }
@@ -176,6 +181,7 @@ func New(options Options) (*Downloader, error) {
 		concurrency: concurrency,
 		maxAttempts: attempts,
 		mediaOrigin: origin,
+		limiter:     options.Limiter,
 		sleeper:     sleep,
 		clock:       clock,
 	}, nil
@@ -184,12 +190,12 @@ func New(options Options) (*Downloader, error) {
 // Download processes bounded concurrent work and returns one result for every
 // input Reference, including work that could not start after cancellation. The
 // caller must hold the output-root lock.
-func (d *Downloader) Download(ctx context.Context, fs *outputfs.FS, work []archive.DownloadWork) []Result {
+func (d *Downloader) Download(ctx context.Context, s store.Store, work []archive.DownloadWork) []Result {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	results := make([]Result, len(work))
-	rootOK := fs != nil
+	rootOK := s != nil
 	for i := range work {
 		results[i] = initialResult(work[i])
 		if !rootOK {
@@ -215,7 +221,7 @@ func (d *Downloader) Download(ctx context.Context, fs *outputfs.FS, work []archi
 		go func() {
 			defer group.Done()
 			for index := range jobs {
-				results[index] = d.process(ctx, fs, work[index])
+				results[index] = d.process(ctx, s, work[index])
 			}
 		}()
 	}
@@ -241,13 +247,13 @@ func initialResult(work archive.DownloadWork) Result {
 	return Result{ReferenceID: work.ReferenceID, Placements: placements}
 }
 
-func (d *Downloader) process(ctx context.Context, fs *outputfs.FS, work archive.DownloadWork) Result {
+func (d *Downloader) process(ctx context.Context, s store.Store, work archive.DownloadWork) Result {
 	result := initialResult(work)
 	if err := ctx.Err(); err != nil {
 		result.Failure = failure(CodeCanceled)
 		return result
 	}
-	stage, stageRel, err := fs.TempFile("", ".pixiegrabber-download-")
+	stage, err := os.CreateTemp("", ".pixiegrabber-download-")
 	if err != nil {
 		result.Failure = failure(CodeStaging)
 		return result
@@ -256,7 +262,7 @@ func (d *Downloader) process(ctx context.Context, fs *outputfs.FS, work archive.
 	defer func() {
 		_ = stage.Close()
 		if removeStage {
-			_ = fs.Remove(stageRel)
+			_ = os.Remove(stage.Name())
 		}
 	}()
 	if err := stage.Chmod(0600); err != nil {
@@ -277,12 +283,19 @@ func (d *Downloader) process(ctx context.Context, fs *outputfs.FS, work archive.
 	result.SHA256 = digest
 	result.Failure = nil
 
+	info, err := stage.Stat()
+	if err != nil {
+		result.Failure = failure(CodeStaging)
+		return result
+	}
+	size := info.Size()
+
 	for i, destination := range work.Destinations {
 		if err := ctx.Err(); err != nil {
 			result.Placements[i].Failure = failure(CodeCanceled)
 			continue
 		}
-		if err := installPlacement(fs, stage, destination); err != nil {
+		if err := installPlacement(s, stage, size, digest, destination); err != nil {
 			result.Placements[i].Failure = failure(CodePlacement)
 			continue
 		}
@@ -349,6 +362,11 @@ func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *u
 	for attempt := 1; attempt <= d.maxAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return fetchResult{kind: fetchCanceled, failure: failure(CodeCanceled)}
+		}
+		if d.limiter != nil {
+			if err := d.limiter.Wait(ctx); err != nil {
+				return fetchResult{kind: fetchCanceled, failure: failure(CodeCanceled)}
+			}
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.String(), nil)
 		if err != nil {
@@ -609,17 +627,14 @@ func validateTestOrigin(value string) error {
 	return nil
 }
 
-func installPlacement(fs *outputfs.FS, stage *os.File, destination archive.Destination) error {
+func installPlacement(s store.Store, stage *os.File, size int64, digest string, destination archive.Destination) error {
 	if err := validateDestination(destination); err != nil {
 		return err
 	}
-	return fs.AtomicReplace(destination.RelativePath, func(w io.Writer) error {
-		if _, err := stage.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		_, err := io.Copy(w, stage)
+	if _, err := stage.Seek(0, io.SeekStart); err != nil {
 		return err
-	})
+	}
+	return s.Put(destination.RelativePath, stage, size, map[string]string{"sha256": digest})
 }
 
 func validateDestination(destination archive.Destination) error {

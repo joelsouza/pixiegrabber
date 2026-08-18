@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"pixiegrabber/internal/outputfs"
+	"pixiegrabber/internal/store"
 )
 
 const (
@@ -341,8 +341,8 @@ func (m *Manifest) Validate() error {
 
 // Load reads, validates, and normalizes a manifest. An absent file can be
 // recognized with errors.Is(err, ErrNotFound) or IsNotFound(err).
-func Load(fs *outputfs.FS, rel string) (*Manifest, error) {
-	f, err := fs.OpenRegular(rel)
+func Load(s store.Store, rel string) (*Manifest, error) {
+	f, err := s.Open(rel)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, rel)
@@ -351,11 +351,6 @@ func Load(fs *outputfs.FS, rel string) (*Manifest, error) {
 	}
 	defer f.Close()
 
-	if info, err := f.Stat(); err != nil {
-		return nil, fmt.Errorf("stat manifest %q: %w", rel, err)
-	} else if info.Size() > MaxManifestBytes {
-		return nil, fmt.Errorf("%w: manifest %q exceeds %d bytes", ErrInvalid, rel, MaxManifestBytes)
-	}
 	data, err := io.ReadAll(io.LimitReader(f, MaxManifestBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read manifest %q: %w", rel, err)
@@ -386,7 +381,7 @@ func Load(fs *outputfs.FS, rel string) (*Manifest, error) {
 // Write validates and atomically replaces rel with a human-readable manifest.
 // The value may be either Manifest or *Manifest. The file and its temporary
 // replacement are owner-readable and owner-writable only.
-func Write(fs *outputfs.FS, rel string, value any) error {
+func Write(s store.Store, rel string, value any) error {
 	m, err := manifestValue(value)
 	if err != nil {
 		return err
@@ -401,10 +396,7 @@ func Write(fs *outputfs.FS, rel string, value any) error {
 	}
 	data = append(data, '\n')
 
-	return fs.AtomicReplace(rel, func(w io.Writer) error {
-		_, err := w.Write(data)
-		return err
-	})
+	return s.Put(rel, bytes.NewReader(data), int64(len(data)), nil)
 }
 
 // IsNotFound reports whether err represents an absent collection manifest.

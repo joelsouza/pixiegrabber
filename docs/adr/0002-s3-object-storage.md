@@ -1,0 +1,3 @@
+# Store output in an S3-compatible bucket
+
+Pixiegrabber stores References and manifests in an S3-compatible bucket when the user enables S3 mode. This keeps large Collections out of local disk and lets several machines share one output. The minio-go client treats S3-compatible endpoints as the default case, so one code path serves AWS S3, MinIO, Cloudflare R2, Backblaze B2, and self-hosted servers. A `Store` interface keeps the local and S3 backends interchangeable, and a lock object preserves the single-writer guarantee that the local flock provides.

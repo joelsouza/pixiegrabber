@@ -212,6 +212,55 @@ func (f *FS) inspect(rel string) (info os.FileInfo, exists bool, result error) {
 	return info, true, nil
 }
 
+// Open returns a reader for a regular, non-link file. It satisfies the
+// store.Store interface and delegates to OpenRegular.
+func (f *FS) Open(rel string) (io.ReadCloser, error) {
+	return f.OpenRegular(rel)
+}
+
+// Put atomically replaces rel with the contents of r. It satisfies the
+// store.Store interface and reuses the AtomicReplace machinery, so the
+// no-overwrite and atomic semantics of media and manifest writes are
+// preserved. metadata is ignored for the local backend.
+func (f *FS) Put(rel string, r io.Reader, size int64, metadata map[string]string) error {
+	if r == nil {
+		return opError("put", errors.New("nil reader"))
+	}
+	return f.AtomicReplace(rel, func(w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+}
+
+// Metadata returns backend metadata for rel. The local backend stores none, so
+// it always returns nil.
+func (f *FS) Metadata(rel string) (map[string]string, error) {
+	return nil, nil
+}
+
+// SameFile reports whether a and b refer to the same underlying object. It is
+// false when either is absent.
+func (f *FS) SameFile(a, b string) (bool, error) {
+	aInfo, aExists, err := f.Inspect(a)
+	if err != nil {
+		return false, err
+	}
+	bInfo, bExists, err := f.Inspect(b)
+	if err != nil {
+		return false, err
+	}
+	if !aExists || !bExists {
+		return false, nil
+	}
+	return os.SameFile(aInfo, bInfo), nil
+}
+
+// Lock returns a no-op release function. The persistent flock is already held
+// by Open and released by Close.
+func (f *FS) Lock() (func() error, error) {
+	return func() error { return nil }, nil
+}
+
 // OpenRegular opens a regular, non-link file for reading.
 func (f *FS) OpenRegular(rel string) (*os.File, error) {
 	f.mu.RLock()

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"pixiegrabber/internal/outputfs"
 	"pixiegrabber/internal/pixieset"
+	"pixiegrabber/internal/store"
 )
 
 // ErrUnsupportedVideo is returned only after a durable sanitized diagnostic
@@ -77,7 +77,7 @@ func (e *UnsupportedVideoError) Unwrap() error { return ErrUnsupportedVideo }
 // first such Set. Sets without videos do not touch the output root. The caller
 // must hold the output-root lock; Task 6 calls this immediately after each
 // GetSet, before it builds any plan or download work.
-func CheckVideos(fs *outputfs.FS, sets []pixieset.Set) error {
+func CheckVideos(s store.Store, sets []pixieset.Set) error {
 	for _, set := range sets {
 		if !set.HasVideos() {
 			continue
@@ -86,7 +86,7 @@ func CheckVideos(fs *outputfs.FS, sets []pixieset.Set) error {
 		if !ok {
 			return errors.New("read unsupported video diagnostic: video data is unavailable")
 		}
-		path, err := writeVideoDiagnostic(fs, raw)
+		path, err := writeVideoDiagnostic(s, raw)
 		if err != nil {
 			return err
 		}
@@ -95,7 +95,7 @@ func CheckVideos(fs *outputfs.FS, sets []pixieset.Set) error {
 	return nil
 }
 
-func writeVideoDiagnostic(fs *outputfs.FS, raw []byte) (string, error) {
+func writeVideoDiagnostic(s store.Store, raw []byte) (string, error) {
 	value, err := sanitizeVideoJSON(raw)
 	if err != nil {
 		return "", err
@@ -108,13 +108,10 @@ func writeVideoDiagnostic(fs *outputfs.FS, raw []byte) (string, error) {
 	if len(data) > maxVideoDiagnosticOutputBytes {
 		return "", errors.New("marshal unsupported video diagnostic: output is too large")
 	}
-	if err := fs.AtomicReplace(diagnosticFilename, func(w io.Writer) error {
-		_, err := w.Write(data)
-		return err
-	}); err != nil {
+	if err := s.Put(diagnosticFilename, bytes.NewReader(data), int64(len(data)), nil); err != nil {
 		return "", err
 	}
-	path, err := fs.DisplayPath(diagnosticFilename)
+	path, err := s.DisplayPath(diagnosticFilename)
 	if err != nil {
 		return "", err
 	}

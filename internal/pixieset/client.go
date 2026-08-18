@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"pixiegrabber/internal/throttle"
 )
 
 const (
@@ -48,6 +51,8 @@ type Client struct {
 	referer              string
 	maxResponseBodyBytes int64
 	maxPages             int
+	lim                  *throttle.Limiter
+	sleep                func(context.Context, time.Duration) error
 }
 
 // ClientOption changes a Client's local transport boundary.
@@ -71,6 +76,12 @@ func WithMaxPages(limit int) ClientOption {
 // WithMaxPageCount is an explicit synonym for WithMaxPages.
 func WithMaxPageCount(limit int) ClientOption { return WithMaxPages(limit) }
 
+// WithThrottle sets the rate limiter applied before every API request. A nil
+// limiter disables throttling.
+func WithThrottle(limiter *throttle.Limiter) ClientOption {
+	return func(c *Client) { c.lim = limiter }
+}
+
 // NewClient creates a client with the supplied API origin and HTTP client.
 // The supplied HTTP client is shallow-cloned and is never modified.
 func NewClient(baseURL string, supplied *http.Client, options ...ClientOption) (*Client, error) {
@@ -93,6 +104,7 @@ func NewClient(baseURL string, supplied *http.Client, options ...ClientOption) (
 		httpClient:           &clone,
 		maxResponseBodyBytes: defaultMaxResponseBodyBytes,
 		maxPages:             defaultMaxPages,
+		sleep:                sleepContext,
 	}
 	for _, option := range options {
 		if option != nil {

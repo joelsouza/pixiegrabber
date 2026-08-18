@@ -6,16 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"sort"
 	"strings"
 	"time"
 
 	"pixiegrabber/internal/manifest"
-	"pixiegrabber/internal/outputfs"
 	"pixiegrabber/internal/paths"
 	"pixiegrabber/internal/pixieset"
+	"pixiegrabber/internal/store"
 )
 
 // Classification is the reason a plan was created.
@@ -76,14 +75,14 @@ type Rename struct {
 // Build makes a plan for source and its discovered Sets. It does not create
 // directories, rename files, download media, or write a manifest. The caller
 // must hold the output-root lock.
-func Build(fs *outputfs.FS, source pixieset.Collection, sets []pixieset.Set, previous *manifest.Manifest, options Options) (Plan, error) {
+func Build(s store.Store, source pixieset.Collection, sets []pixieset.Set, previous *manifest.Manifest, options Options) (Plan, error) {
 	now := optionTime(options)
 	collectionDir := collectionComponent(source.Name, source.ID)
 	if err := validInputID("Collection", source.ID); err != nil {
 		return Plan{}, err
 	}
 
-	classification, prior, err := classify(fs, source, previous, options)
+	classification, prior, err := classify(s, source, previous, options)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -96,13 +95,13 @@ func Build(fs *outputfs.FS, source pixieset.Collection, sets []pixieset.Set, pre
 			return Plan{}, fmt.Errorf("validate healthy manifest: %w", err)
 		}
 		priorDir := collectionComponent(prior.Collection.Name, prior.Collection.ID)
-		if err := validateCollectionRoot(fs, priorDir); err != nil {
+		if err := validateCollectionRoot(s, priorDir); err != nil {
 			return Plan{}, err
 		}
 		return Plan{Classification: classification, CollectionDir: priorDir, Manifest: *prior}, nil
 	}
 	if prior == nil {
-		if err := validateCollectionRoot(fs, collectionDir); err != nil {
+		if err := validateCollectionRoot(s, collectionDir); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -116,7 +115,7 @@ func Build(fs *outputfs.FS, source pixieset.Collection, sets []pixieset.Set, pre
 		return Plan{}, err
 	}
 
-	next, downloads, renames, err := merge(source, orderedSets, setByID, currentReferences, prior, collectionDir, fs, options)
+	next, downloads, renames, err := merge(source, orderedSets, setByID, currentReferences, prior, collectionDir, s, options)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -133,14 +132,14 @@ func Build(fs *outputfs.FS, source pixieset.Collection, sets []pixieset.Set, pre
 // MarkSourceMissing makes a no-work plan for a Collection that was not in
 // discovery. Local records and download state are retained. The caller must
 // hold the output-root lock.
-func MarkSourceMissing(fs *outputfs.FS, previous manifest.Manifest, now time.Time) (Plan, error) {
+func MarkSourceMissing(s store.Store, previous manifest.Manifest, now time.Time) (Plan, error) {
 	previous = cloneManifest(previous)
 	previous.Normalize()
 	if err := previous.Validate(); err != nil {
 		return Plan{}, fmt.Errorf("validate previous manifest: %w", err)
 	}
 	collectionDir := collectionComponent(previous.Collection.Name, previous.Collection.ID)
-	if err := validateCollectionRoot(fs, collectionDir); err != nil {
+	if err := validateCollectionRoot(s, collectionDir); err != nil {
 		return Plan{}, err
 	}
 
@@ -244,7 +243,7 @@ func aggregateReferences(sets []pixieset.Set) ([]currentReference, error) {
 	return result, nil
 }
 
-func classify(fs *outputfs.FS, source pixieset.Collection, previous *manifest.Manifest, options Options) (Classification, *manifest.Manifest, error) {
+func classify(s store.Store, source pixieset.Collection, previous *manifest.Manifest, options Options) (Classification, *manifest.Manifest, error) {
 	if previous == nil {
 		return ClassificationNew, nil, nil
 	}
@@ -257,7 +256,7 @@ func classify(fs *outputfs.FS, source pixieset.Collection, previous *manifest.Ma
 		return "", nil, fmt.Errorf("previous manifest is for Collection %q, not %q", prior.Collection.ID, source.ID)
 	}
 	oldDir := collectionComponent(prior.Collection.Name, prior.Collection.ID)
-	missing, err := inspectManifestFiles(fs, oldDir, prior, options.Verify)
+	missing, err := inspectManifestFiles(s, oldDir, prior, options.Verify)
 	if err != nil {
 		return "", nil, err
 	}
@@ -273,14 +272,14 @@ func classify(fs *outputfs.FS, source pixieset.Collection, previous *manifest.Ma
 	return ClassificationHealthy, &prior, nil
 }
 
-func inspectManifestFiles(fs *outputfs.FS, collectionDir string, m manifest.Manifest, verify bool) (bool, error) {
+func inspectManifestFiles(s store.Store, collectionDir string, m manifest.Manifest, verify bool) (bool, error) {
 	missing := false
 	for _, reference := range m.References {
 		for _, placement := range reference.Placements {
 			if placement.PresenceState != manifest.PresencePresent {
 				continue
 			}
-			exists, checksumOK, err := inspectFile(fs, collectionDir, placement.Path, placement.InstalledSHA256, verify)
+			exists, checksumOK, err := inspectFile(s, collectionDir, placement.Path, placement.InstalledSHA256, verify)
 			if err != nil {
 				return false, err
 			}
@@ -298,30 +297,30 @@ type collectionRootPlan struct {
 	preserveCollection bool
 }
 
-func planCollectionRoot(fs *outputfs.FS, currentDir string, prior *manifest.Manifest) (collectionRootPlan, error) {
+func planCollectionRoot(s store.Store, currentDir string, prior *manifest.Manifest) (collectionRootPlan, error) {
 	if prior == nil {
 		return collectionRootPlan{directory: currentDir}, nil
 	}
 	oldDir := collectionComponent(prior.Collection.Name, prior.Collection.ID)
 	if oldDir == currentDir {
-		if err := validateCollectionRoot(fs, currentDir); err != nil {
+		if err := validateCollectionRoot(s, currentDir); err != nil {
 			return collectionRootPlan{}, err
 		}
 		return collectionRootPlan{directory: currentDir}, nil
 	}
-	oldInfo, oldExists, err := fs.Inspect(oldDir)
+	oldInfo, oldExists, err := s.Inspect(oldDir)
 	if err != nil {
 		return collectionRootPlan{}, err
 	}
 	if oldExists && !oldInfo.IsDir() {
 		return collectionRootPlan{}, fmt.Errorf("inspect Collection directory: old Collection root is not a directory")
 	}
-	_, newExists, err := fs.Inspect(currentDir)
+	_, newExists, err := s.Inspect(currentDir)
 	if err != nil {
 		return collectionRootPlan{}, err
 	}
 	if newExists {
-		sameSource, samePath, err := sameExistingPath(fs, oldDir, currentDir)
+		sameSource, samePath, err := sameExistingPath(s, oldDir, currentDir)
 		if err != nil {
 			return collectionRootPlan{}, err
 		}
@@ -338,8 +337,8 @@ func planCollectionRoot(fs *outputfs.FS, currentDir string, prior *manifest.Mani
 	return collectionRootPlan{directory: currentDir, rootRename: &rename}, nil
 }
 
-func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[string]pixieset.Set, currentReferences []currentReference, prior *manifest.Manifest, collectionDir string, fs *outputfs.FS, options Options) (manifest.Manifest, []DownloadWork, []Rename, error) {
-	rootPlan, err := planCollectionRoot(fs, collectionDir, prior)
+func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[string]pixieset.Set, currentReferences []currentReference, prior *manifest.Manifest, collectionDir string, s store.Store, options Options) (manifest.Manifest, []DownloadWork, []Rename, error) {
+	rootPlan, err := planCollectionRoot(s, collectionDir, prior)
 	if err != nil {
 		return manifest.Manifest{}, nil, nil, err
 	}
@@ -426,7 +425,7 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 			relativePath := portablePlacementPath(sourceSet, current.photo)
 			placement, existed := oldPlacements[setID]
 			if !existed {
-				currentExists, _, err := inspectFile(fs, rootPlan.directory, relativePath, "", false)
+				currentExists, _, err := inspectFile(s, rootPlan.directory, relativePath, "", false)
 				if err != nil {
 					return manifest.Manifest{}, nil, nil, err
 				}
@@ -434,7 +433,7 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 					return manifest.Manifest{}, nil, nil, fmt.Errorf("plan download destination %q: destination already exists", relativePath)
 				}
 				if rootPlan.rootRename != nil {
-					eventualExists, _, err := inspectFile(fs, oldCollectionDir, relativePath, "", false)
+					eventualExists, _, err := inspectFile(s, oldCollectionDir, relativePath, "", false)
 					if err != nil {
 						return manifest.Manifest{}, nil, nil, err
 					}
@@ -447,21 +446,21 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 			} else {
 				oldRelativePath := placement.Path
 				priorDownloadState := placement.DownloadState
-				oldExists, oldChecksumOK, err := inspectFile(fs, oldCollectionDir, oldRelativePath, placement.InstalledSHA256, options.Verify)
+				oldExists, oldChecksumOK, err := inspectFile(s, oldCollectionDir, oldRelativePath, placement.InstalledSHA256, options.Verify)
 				if err != nil {
 					return manifest.Manifest{}, nil, nil, err
 				}
-				currentExists, _, err := inspectFile(fs, rootPlan.directory, relativePath, "", false)
+				currentExists, _, err := inspectFile(s, rootPlan.directory, relativePath, "", false)
 				if err != nil {
 					return manifest.Manifest{}, nil, nil, err
 				}
 				if rootPlan.rootRename != nil {
-					eventualExists, _, err := inspectFile(fs, oldCollectionDir, relativePath, "", false)
+					eventualExists, _, err := inspectFile(s, oldCollectionDir, relativePath, "", false)
 					if err != nil {
 						return manifest.Manifest{}, nil, nil, err
 					}
 					if eventualExists {
-						sameSource, err := sameRegularFile(fs, oldCollectionDir, oldRelativePath, relativePath)
+						sameSource, err := sameRegularFile(s, oldCollectionDir, oldRelativePath, relativePath)
 						if err != nil {
 							return manifest.Manifest{}, nil, nil, err
 						}
@@ -474,7 +473,7 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 				checksumInvalid := options.Verify && oldExists && !oldChecksumOK
 				trustedExisting := priorDownloadState == manifest.DownloadComplete && oldExists && !checksumInvalid
 				if pathChanged && currentExists {
-					sameSource, err := sameRegularFile(fs, rootPlan.directory, oldRelativePath, relativePath)
+					sameSource, err := sameRegularFile(s, rootPlan.directory, oldRelativePath, relativePath)
 					if err != nil {
 						return manifest.Manifest{}, nil, nil, err
 					}
@@ -674,9 +673,9 @@ func manifestNeedsWork(m manifest.Manifest) bool {
 	return false
 }
 
-func inspectFile(fs *outputfs.FS, collectionDir, relativePath, checksum string, verify bool) (bool, bool, error) {
+func inspectFile(s store.Store, collectionDir, relativePath, checksum string, verify bool) (bool, bool, error) {
 	rel := path.Join(collectionDir, relativePath)
-	info, exists, err := fs.Inspect(rel)
+	info, exists, err := s.Inspect(rel)
 	if err != nil {
 		return false, false, err
 	}
@@ -692,19 +691,26 @@ func inspectFile(fs *outputfs.FS, collectionDir, relativePath, checksum string, 
 	if checksum == "" {
 		return true, false, nil
 	}
-	got, err := fileSHA256(fs, rel, relativePath)
+	// S3 fast path: trust the stored sha256 metadata instead of re-reading the
+	// object. LocalStore.Metadata returns nil, so local behavior is unchanged.
+	if metadata, err := s.Metadata(rel); err == nil {
+		if stored, ok := metadata["sha256"]; ok && strings.EqualFold(stored, checksum) {
+			return true, true, nil
+		}
+	}
+	got, err := fileSHA256(s, rel, relativePath)
 	if err != nil {
 		return false, false, err
 	}
 	return true, strings.EqualFold(got, checksum), nil
 }
 
-func sameRegularFile(fs *outputfs.FS, collectionDir, sourcePath, destinationPath string) (bool, error) {
-	sourceInfo, sourceExists, err := fs.Inspect(path.Join(collectionDir, sourcePath))
+func sameRegularFile(s store.Store, collectionDir, sourcePath, destinationPath string) (bool, error) {
+	sourceInfo, sourceExists, err := s.Inspect(path.Join(collectionDir, sourcePath))
 	if err != nil {
 		return false, err
 	}
-	destinationInfo, destinationExists, err := fs.Inspect(path.Join(collectionDir, destinationPath))
+	destinationInfo, destinationExists, err := s.Inspect(path.Join(collectionDir, destinationPath))
 	if err != nil {
 		return false, err
 	}
@@ -714,30 +720,38 @@ func sameRegularFile(fs *outputfs.FS, collectionDir, sourcePath, destinationPath
 	if !sourceInfo.Mode().IsRegular() || !destinationInfo.Mode().IsRegular() {
 		return false, nil
 	}
-	return os.SameFile(sourceInfo, destinationInfo), nil
+	same, err := s.SameFile(path.Join(collectionDir, sourcePath), path.Join(collectionDir, destinationPath))
+	if err != nil {
+		return false, err
+	}
+	return same, nil
 }
 
-func sameExistingPath(fs *outputfs.FS, sourcePath, destinationPath string) (bool, bool, error) {
-	sourceInfo, sourceExists, err := fs.Inspect(sourcePath)
+func sameExistingPath(s store.Store, sourcePath, destinationPath string) (bool, bool, error) {
+	_, sourceExists, err := s.Inspect(sourcePath)
 	if err != nil {
 		return false, false, err
 	}
-	destinationInfo, destinationExists, err := fs.Inspect(destinationPath)
+	_, destinationExists, err := s.Inspect(destinationPath)
 	if err != nil {
 		return false, false, err
 	}
 	if !sourceExists || !destinationExists {
 		return false, false, nil
 	}
-	return os.SameFile(sourceInfo, destinationInfo), sameCaseOnlyPath(sourcePath, destinationPath), nil
+	same, err := s.SameFile(sourcePath, destinationPath)
+	if err != nil {
+		return false, false, err
+	}
+	return same, sameCaseOnlyPath(sourcePath, destinationPath), nil
 }
 
 func sameCaseOnlyPath(sourcePath, destinationPath string) bool {
 	return sourcePath != destinationPath && strings.EqualFold(path.Clean(sourcePath), path.Clean(destinationPath))
 }
 
-func fileSHA256(fs *outputfs.FS, rel, relativePath string) (string, error) {
-	file, err := fs.OpenRegular(rel)
+func fileSHA256(s store.Store, rel, relativePath string) (string, error) {
+	file, err := s.Open(rel)
 	if err != nil {
 		return "", fmt.Errorf("open for checksum placement %q: %v", relativePath, err)
 	}
@@ -900,8 +914,8 @@ func collectionComponent(name, id string) string {
 	return paths.CollectionComponent(name, id)
 }
 
-func validateCollectionRoot(fs *outputfs.FS, collectionDir string) error {
-	info, exists, err := fs.Inspect(collectionDir)
+func validateCollectionRoot(s store.Store, collectionDir string) error {
+	info, exists, err := s.Inspect(collectionDir)
 	if err != nil {
 		return err
 	}
