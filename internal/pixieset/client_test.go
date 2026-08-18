@@ -340,7 +340,6 @@ func TestClientRejectsMissingRequiredNumericFields(t *testing.T) {
 	}{
 		{name: "photo count", field: "photo_count", want: "Collection photo count is missing"},
 		{name: "video count", field: "video_count", want: "Collection video count is missing"},
-		{name: "rank", field: "rank", want: "Collection rank is missing"},
 	}
 	for _, test := range collectionFields {
 		t.Run("Collection "+test.name, func(t *testing.T) {
@@ -379,8 +378,6 @@ func TestClientRejectsMissingRequiredNumericFields(t *testing.T) {
 		want  string
 	}{
 		{name: "photo count", field: "photo_count", want: "Set photo count is missing"},
-		{name: "video count", field: "video_count", want: "Set video count is missing"},
-		{name: "rank", field: "rank", want: "Set rank is missing"},
 	}
 	for _, test := range setFields {
 		t.Run("Set "+test.name, func(t *testing.T) {
@@ -458,7 +455,6 @@ func TestNormalizeRejectsMissingIDsAndRelationships(t *testing.T) {
 		Name:       "Collection",
 		PhotoCount: wireInt{value: 0, present: true},
 		VideoCount: wireInt{value: 0, present: true},
-		Rank:       wireInt{value: 0, present: true},
 	}
 	collection.ID = wireID{}
 	if _, err := normalizeCollection(collection); err == nil || err.Error() != "collection ID is missing" {
@@ -680,6 +676,123 @@ func TestClientRetries429HonoringRetryAfter(t *testing.T) {
 	}
 }
 
+// Pixieset sends no rank for a Collection or a Set. Only an image record has
+// one. These tests hold the real response shape.
+func TestListCollectionsAcceptsAResponseWithoutARank(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, dashboardPage(1, 1,
+			`[{"id":"117855994","name":"Collection","photo_count":131,"video_count":0}]`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collections, err := client.ListCollections(context.Background())
+	if err != nil {
+		t.Fatalf("ListCollections() error = %v", err)
+	}
+	if len(collections) != 1 || collections[0].ID != "117855994" || collections[0].PhotoCount != 131 {
+		t.Fatalf("ListCollections() = %#v", collections)
+	}
+}
+
+func TestListSetsOrdersSetsByPositionWhenTheResponseHasNoRank(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[`+
+			`{"id":"169355728","collection_id":"1","name":"First","photo_count":122,"video_count":0},`+
+			`{"id":"169736640","collection_id":"1","name":"Second","photo_count":9,"video_count":0}]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets, err := client.ListSets(context.Background(), "1")
+	if err != nil {
+		t.Fatalf("ListSets() error = %v", err)
+	}
+	if len(sets) != 2 {
+		t.Fatalf("ListSets() returned %d Sets", len(sets))
+	}
+	// The response order gives the display order, and ranks start at 1.
+	if sets[0].Rank != 1 || sets[1].Rank != 2 {
+		t.Fatalf("Set ranks = %d and %d, want 1 and 2", sets[0].Rank, sets[1].Rank)
+	}
+	if sets[0].Name != "First" || sets[1].Name != "Second" {
+		t.Fatalf("Set order = %q then %q", sets[0].Name, sets[1].Name)
+	}
+}
+
+// The single-Set response is thinner than the Set list. It sends no video
+// count and no rank, and it can send a null description.
+func TestGetSetAcceptsTheThinSingleSetResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"id":"169355728","collection_id":"117855994",`+
+			`"name":"Destaques","description":null,"photo_count":1,"private":false,"download":true,`+
+			`"photos":[`+validPhotoInCollection("3", "169355728", "117855994")+`],"videos":[]}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := client.GetSet(context.Background(), "117855994", "169355728")
+	if err != nil {
+		t.Fatalf("GetSet() error = %v", err)
+	}
+	if set.Name != "Destaques" || set.Description != "" || len(set.Photos) != 1 {
+		t.Fatalf("GetSet() = %#v", set)
+	}
+	if set.VideoCount != 0 || set.HasVideos() {
+		t.Fatalf("video count = %d, HasVideos = %v", set.VideoCount, set.HasVideos())
+	}
+}
+
+func TestGetSetCountsTheVideosItReceives(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"id":"2","collection_id":"1","name":"Set",`+
+			`"photo_count":0,"photos":[],"videos":[{"kind":"video"},{"kind":"video"}]}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := client.GetSet(context.Background(), "1", "2")
+	if err != nil {
+		t.Fatalf("GetSet() error = %v", err)
+	}
+	// No video count arrives, so the videos themselves give it.
+	if set.VideoCount != 2 || !set.HasVideos() {
+		t.Fatalf("video count = %d, want 2", set.VideoCount)
+	}
+}
+
+func TestListSetsKeepsARankThatPixiesetSends(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[`+
+			`{"id":"2","collection_id":"1","name":"Only","photo_count":0,"video_count":0,"rank":7}]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets, err := client.ListSets(context.Background(), "1")
+	if err != nil {
+		t.Fatalf("ListSets() error = %v", err)
+	}
+	if len(sets) != 1 || sets[0].Rank != 7 {
+		t.Fatalf("Set rank = %#v, want the rank from the response", sets)
+	}
+}
+
 func dashboardPage(current, last int, collections string) string {
 	return `{"data":{"data":{"collections":` + collections + `},"meta":{"current_page":` + stringInt(current) + `,"last_page":` + stringInt(last) + `}}}`
 }
@@ -703,3 +816,7 @@ func stringInt(value int) string {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func validPhotoInCollection(id, setID, collectionID string) string {
+	return `{"id":"` + id + `","collection_id":"` + collectionID + `","gallery_id":"` + setID + `","name":"Photo","description":"","mime_type":"image/jpeg","ext":"jpg","size":1,"width":1,"height":1,"rank":1,"path_medium":"//images.pixieset.com/photo.jpg"}`
+}

@@ -22,7 +22,7 @@ var testNow = time.Date(2026, time.August, 10, 15, 0, 0, 0, time.FixedZone("test
 
 func testCollection() pixieset.Collection {
 	created := testNow.Add(-24 * time.Hour)
-	return pixieset.Collection{ID: "100", Name: "Collection", Description: "source", Rank: 1, CreatedAt: &created}
+	return pixieset.Collection{ID: "100", Name: "Collection", Description: "source", CreatedAt: &created}
 }
 
 func testSet(collectionID, id, name string, rank int, photos ...pixieset.Photo) pixieset.Set {

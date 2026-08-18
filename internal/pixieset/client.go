@@ -219,6 +219,11 @@ func (c *Client) ListSets(ctx context.Context, collectionID string) ([]Set, erro
 			return nil, operationError(operation, set.ID, errors.New("duplicate Set ID"))
 		}
 		seen[set.ID] = struct{}{}
+		// Pixieset sends the Sets in display order but sends no rank, so the
+		// position gives the order. Ranks start at 1.
+		if set.Rank == 0 {
+			set.Rank = index + 1
+		}
 		sets = append(sets, set)
 	}
 	return sets, nil

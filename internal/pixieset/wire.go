@@ -40,7 +40,6 @@ type wireCollection struct {
 	Description string          `json:"description"`
 	PhotoCount  wireInt         `json:"photo_count"`
 	VideoCount  wireInt         `json:"video_count"`
-	Rank        wireInt         `json:"rank"`
 	EventDate   json.RawMessage `json:"event_date"`
 	CreatedAt   json.RawMessage `json:"create_at"`
 }

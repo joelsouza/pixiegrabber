@@ -87,8 +87,9 @@ Pixiegrabber maps Pixieset's API term `gallery` to the domain term **Set**.
 
 - `GET /api/v1/dashboard_listings?page={page}` returns Collection summaries and pagination metadata.
 - `GET /api/v1/collections/{collection_id}/galleries` returns the Sets in one Collection. Each Set includes its ID, Collection ID, name, description, image count, and video count.
-- `GET /api/v1/galleries/{set_id}?expand=photos.starred%2Cvideos` returns one Set with `photos` and `videos` arrays.
+- `GET /api/v1/galleries/{set_id}?expand=photos.starred%2Cvideos` returns one Set with `photos` and `videos` arrays. This response is thinner than the Set list: it sends no video count, and its description can be `null`. The `videos` array gives the video count.
 - An image record includes its media ID, Collection ID, Set ID, name, MIME type, extension, byte size, dimensions, rank, capture date, and named media variants through `path_xxlarge`.
+- Only an image record has a rank. A Collection record and a Set record have none, so the order of the Sets in the Set list gives their display order.
 
 The API origin is exactly `https://galleries.pixieset.com` on the default HTTPS port. The media origin is exactly `https://images.pixieset.com` on the default HTTPS port. API and media clients reject redirects. The media client has no cookie jar and sends no authorization, CSRF, Origin, or Referer header.
 

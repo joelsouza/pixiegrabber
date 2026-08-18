@@ -44,10 +44,6 @@ func normalizeCollection(item wireCollection) (Collection, error) {
 	if err != nil {
 		return Collection{}, err
 	}
-	rank, err := requiredInteger(item.Rank, "Collection rank", false)
-	if err != nil {
-		return Collection{}, err
-	}
 	eventDate, err := nullableDate(item.EventDate)
 	if err != nil {
 		return Collection{}, fmt.Errorf("Collection event date: %w", err)
@@ -56,7 +52,7 @@ func normalizeCollection(item wireCollection) (Collection, error) {
 	if err != nil {
 		return Collection{}, fmt.Errorf("Collection create date: %w", err)
 	}
-	return Collection{ID: id, Name: item.Name, Description: item.Description, PhotoCount: int(photoCount), VideoCount: int(videoCount), Rank: int(rank), EventDate: eventDate, CreatedAt: createdAt}, nil
+	return Collection{ID: id, Name: item.Name, Description: item.Description, PhotoCount: int(photoCount), VideoCount: int(videoCount), EventDate: eventDate, CreatedAt: createdAt}, nil
 }
 
 func normalizeSet(item wireSet, expectedCollection, expectedSet string, content bool, baseURL *url.URL) (Set, error) {
@@ -84,11 +80,18 @@ func normalizeSet(item wireSet, expectedCollection, expectedSet string, content 
 	if err != nil {
 		return Set{}, err
 	}
-	videoCount, err := requiredInteger(item.VideoCount, "Set video count", false)
+	// The Set list sends a video count, but the single-Set response does not.
+	// That response carries the videos themselves, so they give the count.
+	videoCount, present, err := integerField(item.VideoCount, "Set video count", false)
 	if err != nil {
 		return Set{}, err
 	}
-	rank, err := requiredInteger(item.Rank, "Set rank", false)
+	if !present && content {
+		videoCount = int64(len(item.Videos))
+	}
+	// Pixieset does not send a Set rank. The order of the Sets in the response
+	// gives the display order instead, and ListSets supplies it.
+	rank, _, err := integerField(item.Rank, "Set rank", false)
 	if err != nil {
 		return Set{}, err
 	}

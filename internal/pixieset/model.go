@@ -9,7 +9,6 @@ type Collection struct {
 	Description string     `json:"description"`
 	PhotoCount  int        `json:"photo_count"`
 	VideoCount  int        `json:"video_count"`
-	Rank        int        `json:"rank"`
 	EventDate   *time.Time `json:"event_date,omitempty"`
 	CreatedAt   *time.Time `json:"create_at,omitempty"`
 }

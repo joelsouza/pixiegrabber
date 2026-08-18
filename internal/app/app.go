@@ -163,6 +163,8 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			if err != nil {
 				return err
 			}
+			// Only the Set list gives the display order, so keep it.
+			full.Rank = set.Rank
 			fullSets = append(fullSets, full)
 		}
 		if err := archive.CheckVideos(s, fullSets); err != nil {
