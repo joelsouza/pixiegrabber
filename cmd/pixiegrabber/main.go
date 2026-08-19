@@ -4,10 +4,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"pixiegrabber/internal/app"
@@ -24,6 +27,7 @@ func main() {
 	flag.BoolVar(&options.SyncExisting, "sync-existing", false, "refresh completed Collections and represent remote removals without deleting local files")
 	flag.BoolVar(&options.Verify, "verify", false, "check every local Placement against its saved SHA-256 checksum and restore missing or changed files")
 	flag.BoolVar(&options.Yes, "yes", false, "accept the download plan without an interactive prompt")
+	flag.BoolVar(&options.Quiet, "quiet", false, "hide the progress lines; the run log is still written")
 	flag.IntVar(&options.Concurrency, "concurrency", 4, "set concurrent Reference downloads")
 	flag.StringVar(&options.UserAgent, "user-agent", "", "override the User-Agent detected from the selected browser")
 	flag.BoolVar(&options.S3, "s3", false, "store output in an S3-compatible bucket instead of a local directory")
@@ -50,7 +54,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := app.Run(context.Background(), options, os.Stdout, os.Stdin); err != nil {
+	// Ctrl-C cancels the run so that the tool can save its log and release the
+	// output lock. A second Ctrl-C ends the process at once.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
+	if err := app.Run(ctx, options, os.Stdout, os.Stdin); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "pixiegrabber: stopped")
+			os.Exit(130)
+		}
 		fmt.Fprintf(os.Stderr, "pixiegrabber: %v\n", err)
 		os.Exit(1)
 	}

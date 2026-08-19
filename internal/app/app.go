@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"pixiegrabber/internal/manifest"
 	"pixiegrabber/internal/paths"
 	"pixiegrabber/internal/pixieset"
+	"pixiegrabber/internal/runlog"
 	"pixiegrabber/internal/store"
 	"pixiegrabber/internal/throttle"
 )
@@ -39,6 +41,8 @@ type Options struct {
 	Concurrency        int
 	UserAgent          string
 	Interval           time.Duration
+	// Quiet hides the progress lines. The run log is always written.
+	Quiet bool
 
 	// S3 mode. When S3 is enabled, Output is not required and the store is
 	// backed by an S3-compatible bucket instead of a local directory.
@@ -106,6 +110,28 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		return fmt.Errorf("concurrency must be between 1 and %d", maxConcurrency)
 	}
 
+	// The terminal writer is nil in quiet mode. The log file is always kept.
+	progressOut := stdout
+	if options.Quiet {
+		progressOut = nil
+	}
+	logger := runlog.New(progressOut, nil)
+	started := time.Now()
+	outcome := "failed"
+	mode := "local"
+	if options.S3 {
+		mode = "s3"
+	}
+	// The bucket name is not a secret. The access keys never reach the log.
+	logger.Event("run_start", map[string]any{
+		"mode":          mode,
+		"concurrency":   concurrency,
+		"interval_s":    options.Interval.Seconds(),
+		"sync_existing": options.SyncExisting,
+		"verify":        options.Verify,
+		"bucket":        options.S3Bucket,
+	})
+
 	session := options.session
 	if session.Jar == nil {
 		var err error
@@ -114,6 +140,14 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			return err
 		}
 		reportCookieSource(stdout, session)
+		logger.Event("cookies", map[string]any{
+			"browser":         session.Browser,
+			"profile":         session.Profile,
+			"container":       session.Container,
+			"session_cookies": session.SessionCookies,
+			"token_cookies":   session.TokenCookies,
+			"cookies":         session.Cookies,
+		})
 	}
 	userAgent := options.UserAgent
 	if userAgent == "" {
@@ -128,18 +162,37 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		return err
 	}
 	defer s.Close()
+	// The events from before this point stay in memory and reach the file at
+	// the first write.
+	logger.Attach(s)
 	release, err := s.Lock()
 	if err != nil {
 		return err
 	}
 	defer release()
+	// This runs before release and before s.Close, because Go runs deferred
+	// calls in reverse order. The log must reach the store while the store is
+	// still open and the lock is still held.
+	defer func() {
+		// A cancelled context means the person stopped the run, which is not
+		// a failure. A reader of the log must see the difference.
+		if outcome == "failed" && ctx.Err() != nil {
+			outcome = "stopped"
+		}
+		logger.Event("run_end", map[string]any{
+			"outcome":    outcome,
+			"duration_s": int(time.Since(started).Seconds()),
+		})
+		_ = logger.Close()
+	}()
 
 	apiBase := options.apiBaseURL
 	if apiBase == "" {
 		apiBase = productionAPIBase
 	}
 	lim := throttle.New(options.Interval)
-	client, err := pixieset.NewClient(apiBase, &http.Client{Jar: session.Jar}, pixieset.WithUserAgent(userAgent), pixieset.WithThrottle(lim))
+	client, err := pixieset.NewClient(apiBase, &http.Client{Jar: session.Jar},
+		pixieset.WithUserAgent(userAgent), pixieset.WithThrottle(lim), pixieset.WithReporter(logger))
 	if err != nil {
 		return err
 	}
@@ -148,16 +201,18 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 	if err != nil {
 		return err
 	}
+	logger.Event("discovery_done", map[string]any{"collections": len(collections)})
 
 	discovered := make(map[string]struct{}, len(collections))
 	var plans []collectionPlan
-	for _, collection := range collections {
+	for index, collection := range collections {
 		discovered[collection.ID] = struct{}{}
 		sets, err := client.ListSets(ctx, collection.ID)
 		if err != nil {
 			return err
 		}
 		fullSets := make([]pixieset.Set, 0, len(sets))
+		images := 0
 		for _, set := range sets {
 			full, err := client.GetSet(ctx, collection.ID, set.ID)
 			if err != nil {
@@ -165,8 +220,21 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 			}
 			// Only the Set list gives the display order, so keep it.
 			full.Rank = set.Rank
+			images += len(full.Photos)
 			fullSets = append(fullSets, full)
 		}
+		// Each Collection costs one call for its list and one for each Set, so
+		// this line is the proof that a long search continues.
+		logger.Progress(
+			fmt.Sprintf("[%*d/%d] %s: %s, %s",
+				len(strconv.Itoa(len(collections))), index+1, len(collections),
+				collection.Name, count(len(fullSets), "set"), count(images, "image")),
+			"collection",
+			map[string]any{
+				"i": index + 1, "of": len(collections), "id": collection.ID,
+				"sets": len(fullSets), "images": images,
+			},
+		)
 		if err := archive.CheckVideos(s, fullSets); err != nil {
 			if errors.Is(err, archive.ErrUnsupportedVideo) {
 				var videoErr *archive.UnsupportedVideoError
@@ -174,6 +242,8 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 					fmt.Fprintf(stdout, "unsupported video detected; diagnostic: %s\n", videoErr.Path())
 				}
 			}
+			outcome = "unsupported_video"
+			logger.Event("video_stop", map[string]any{"collection": collection.ID})
 			return err
 		}
 		previous, err := loadPreviousManifest(s, collection)
@@ -226,22 +296,25 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 	}
 
 	displayPlan(stdout, plans)
+	logger.Event("plan", planFields(plans))
 
 	if !options.Yes {
 		fmt.Fprint(stdout, "Proceed? [y/N] ")
 		answer, err := bufio.NewReader(stdin).ReadString('\n')
 		if err != nil && answer == "" {
+			outcome = "declined"
 			return nil
 		}
 		answer = strings.TrimSpace(answer)
 		if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+			outcome = "declined"
 			return nil
 		}
 	}
 
 	now := time.Now().UTC()
 	for i := range plans {
-		if err := executePlan(ctx, s, concurrency, options.mediaOrigin, lim, &plans[i].plan, now); err != nil {
+		if err := executePlan(ctx, s, concurrency, options.mediaOrigin, lim, logger, &plans[i].plan, now); err != nil {
 			return err
 		}
 	}
@@ -254,11 +327,48 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 	for _, cp := range plans {
 		for _, ref := range cp.plan.Manifest.References {
 			if ref.PresenceState == manifest.PresencePresent && ref.DownloadState == manifest.DownloadFailed {
+				outcome = "incomplete"
 				return errors.New("one or more References failed to download; run again to resume")
 			}
 		}
 	}
+	outcome = "completed"
 	return nil
+}
+
+// count writes a number and its noun, with a plural s when the number is not
+// one.
+func count(value int, noun string) string {
+	if value == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", value, noun)
+}
+
+// planFields summarizes the plan for the run log. It repeats the totals that
+// displayPlan writes for the person.
+func planFields(plans []collectionPlan) map[string]any {
+	references, placements := 0, 0
+	var sourceBytes int64
+	for _, cp := range plans {
+		for _, ref := range cp.plan.Manifest.References {
+			references++
+			for _, placement := range ref.Placements {
+				if placement.PresenceState == manifest.PresencePresent {
+					placements++
+				}
+			}
+		}
+		for _, work := range cp.plan.Downloads {
+			sourceBytes += work.SourceBytes
+		}
+	}
+	return map[string]any{
+		"collections":  len(plans),
+		"references":   references,
+		"placements":   placements,
+		"source_bytes": sourceBytes,
+	}
 }
 
 // selectStore returns the backend for a run. An explicit Store seam wins;
@@ -342,7 +452,7 @@ func collectionIDFromDir(name string) string {
 	return name[idx+2:]
 }
 
-func executePlan(ctx context.Context, s store.Store, concurrency int, mediaOrigin string, limiter *throttle.Limiter, plan *archive.Plan, now time.Time) error {
+func executePlan(ctx context.Context, s store.Store, concurrency int, mediaOrigin string, limiter *throttle.Limiter, reporter download.Reporter, plan *archive.Plan, now time.Time) error {
 	for _, rename := range plan.Renames {
 		if err := applyRename(s, rename); err != nil {
 			return err
@@ -354,6 +464,7 @@ func executePlan(ctx context.Context, s store.Store, concurrency int, mediaOrigi
 			Concurrency: concurrency,
 			MediaOrigin: mediaOrigin,
 			Limiter:     limiter,
+			Reporter:    reporter,
 		})
 		if err != nil {
 			return err

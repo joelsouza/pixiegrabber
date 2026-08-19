@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"image"
 	"image/color"
@@ -21,6 +22,7 @@ import (
 	"pixiegrabber/internal/browsercookies"
 	"pixiegrabber/internal/manifest"
 	"pixiegrabber/internal/outputfs"
+	"pixiegrabber/internal/runlog"
 )
 
 func TestReportCookieSource(t *testing.T) {
@@ -115,6 +117,111 @@ func tempOutput(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func TestRunWritesTheRunLogAndProgressLines(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	defer api.Close()
+
+	output := tempOutput(t)
+	var stdout bytes.Buffer
+	if err := Run(context.Background(), testOptions(output, api.URL, media.URL), &stdout, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The person sees the Collection while a long search runs.
+	if got := stdout.String(); !strings.Contains(got, "[1/1] Collection: 1 set, 1 image") {
+		t.Fatalf("stdout = %q, want a Collection progress line", got)
+	}
+
+	data, err := os.ReadFile(filepath.Join(output, runlog.LogFilename))
+	if err != nil {
+		t.Fatalf("run log missing: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		`"ev":"run_start"`, `"ev":"discovery_done"`, `"ev":"collection"`,
+		`"ev":"plan"`, `"ev":"run_end"`, `"outcome":"completed"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("run log has no %s:\n%s", want, text)
+		}
+	}
+	// Every line must be one JSON object, so a program can read the file.
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("line %q is not JSON: %v", line, err)
+		}
+		if event["ev"] == nil || event["t"] == nil {
+			t.Fatalf("line %q has no ev or t", line)
+		}
+	}
+	// No URL and no secret may reach the file.
+	if strings.Contains(text, "://") {
+		t.Fatalf("run log holds a URL:\n%s", text)
+	}
+}
+
+func TestQuietRunStillWritesTheRunLog(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	defer api.Close()
+
+	output := tempOutput(t)
+	options := testOptions(output, api.URL, media.URL)
+	options.Quiet = true
+	var stdout bytes.Buffer
+	if err := Run(context.Background(), options, &stdout, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "1 set,") {
+		t.Fatalf("quiet run printed progress: %q", stdout.String())
+	}
+	// displayPlan is not progress, so it stays.
+	if !strings.Contains(stdout.String(), "Collections: 1") {
+		t.Fatalf("quiet run lost the plan totals: %q", stdout.String())
+	}
+	data, err := os.ReadFile(filepath.Join(output, runlog.LogFilename))
+	if err != nil {
+		t.Fatalf("run log missing: %v", err)
+	}
+	if !strings.Contains(string(data), `"ev":"collection"`) {
+		t.Fatalf("quiet run lost the log events:\n%s", data)
+	}
+}
+
+func TestRunLogRecordsADeclinedPlan(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	defer api.Close()
+
+	output := tempOutput(t)
+	options := testOptions(output, api.URL, media.URL)
+	options.Yes = false
+	if err := Run(context.Background(), options, io.Discard, strings.NewReader("n\n")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(output, runlog.LogFilename))
+	if err != nil {
+		t.Fatalf("run log missing: %v", err)
+	}
+	if !strings.Contains(string(data), `"outcome":"declined"`) {
+		t.Fatalf("run log does not record the refusal:\n%s", data)
+	}
 }
 
 func TestRunFirstRunDownloadsAndWritesManifest(t *testing.T) {

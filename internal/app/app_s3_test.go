@@ -20,6 +20,7 @@ import (
 	"pixiegrabber/internal/archive"
 	"pixiegrabber/internal/browsercookies"
 	"pixiegrabber/internal/manifest"
+	"pixiegrabber/internal/runlog"
 )
 
 const s3TestBucket = "pixiegrabber-e2e"
@@ -95,6 +96,40 @@ func getObject(t *testing.T, client *minio.Client, key string) []byte {
 		t.Fatalf("ReadAll %q: %v", key, err)
 	}
 	return data
+}
+
+func TestRunS3ModeWritesTheRunLogToTheBucket(t *testing.T) {
+	endpoint, client := s3Fixture(t)
+	t.Setenv("PIXIEGRABBER_S3_ACCESS_KEY", "test-access")
+	t.Setenv("PIXIEGRABBER_S3_SECRET_KEY", "test-secret")
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	defer api.Close()
+
+	if err := Run(context.Background(), s3Options(api.URL, media.URL, endpoint), io.Discard, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := listKeys(t, client)[runlog.LogFilename]; !ok {
+		t.Fatalf("bucket has no %s: %v", runlog.LogFilename, listKeys(t, client))
+	}
+	text := string(getObject(t, client, runlog.LogFilename))
+	for _, want := range []string{`"ev":"run_start"`, `"mode":"s3"`, `"outcome":"completed"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("run log has no %s:\n%s", want, text)
+		}
+	}
+	// The bucket name may appear, but no key and no URL.
+	if strings.Contains(text, "://") {
+		t.Fatalf("run log holds a URL:\n%s", text)
+	}
+	if strings.Contains(text, "test-access") || strings.Contains(text, "test-secret") {
+		t.Fatalf("run log holds an S3 credential:\n%s", text)
+	}
 }
 
 func TestRunS3ModeDownloadsToBucket(t *testing.T) {

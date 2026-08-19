@@ -18,6 +18,10 @@ import (
 // maxRequestAttempts bounds retries after transient 429/5xx responses.
 const maxRequestAttempts = 5
 
+// reportWaitFrom is the shortest retry wait that the person sees. A short
+// backoff stays in the log only, so the terminal does not fill with noise.
+const reportWaitFrom = 2 * time.Second
+
 func (c *Client) requestJSON(ctx context.Context, operation, subject, path string) ([]byte, error) {
 	requestURL := *c.baseURL
 	parsedPath, err := url.Parse(path)
@@ -77,7 +81,26 @@ func (c *Client) requestJSON(ctx context.Context, operation, subject, path strin
 		if attempt == maxRequestAttempts-1 {
 			return nil, &HTTPError{Operation: operation, ID: subject, Status: status}
 		}
-		delay := retryDelay(response.Header.Get("Retry-After"), attempt)
+		header := response.Header.Get("Retry-After")
+		delay := retryDelay(header, attempt)
+		reason := "backoff"
+		if strings.TrimSpace(header) != "" {
+			reason = "retry_after"
+		}
+		// Pixieset can ask for a long wait. Without this line the tool looks
+		// dead while it obeys.
+		line := ""
+		if delay >= reportWaitFrom {
+			line = fmt.Sprintf("Pixieset asked to wait %s (HTTP %d). Attempt %d of %d.",
+				delay.Round(time.Second), status, attempt+1, maxRequestAttempts)
+		}
+		c.reportProgress(line, "retry_wait", map[string]any{
+			"status":  status,
+			"attempt": attempt + 1,
+			"of":      maxRequestAttempts,
+			"seconds": delay.Seconds(),
+			"reason":  reason,
+		})
 		if err := c.sleep(ctx, delay); err != nil {
 			return nil, err
 		}

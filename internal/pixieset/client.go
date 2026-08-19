@@ -43,6 +43,16 @@ func (e *HTTPError) Error() string {
 
 func (e *HTTPError) Unwrap() error { return ErrHTTPStatus }
 
+// Reporter records progress. The runlog Logger satisfies it, so this package
+// needs no import of the logger and the logger needs none of this package.
+type Reporter interface {
+	// Event records one event for a program to read.
+	Event(name string, fields map[string]any)
+	// Progress writes one line for the person and records the same event. An
+	// empty line writes nothing to the terminal.
+	Progress(line, name string, fields map[string]any)
+}
+
 // Client is the isolated Pixieset JSON API client.
 type Client struct {
 	baseURL              *url.URL
@@ -52,7 +62,22 @@ type Client struct {
 	maxResponseBodyBytes int64
 	maxPages             int
 	lim                  *throttle.Limiter
+	reporter             Reporter
 	sleep                func(context.Context, time.Duration) error
+}
+
+// report sends one event when a reporter exists.
+func (c *Client) report(name string, fields map[string]any) {
+	if c.reporter != nil {
+		c.reporter.Event(name, fields)
+	}
+}
+
+// reportProgress sends one terminal line and one event when a reporter exists.
+func (c *Client) reportProgress(line, name string, fields map[string]any) {
+	if c.reporter != nil {
+		c.reporter.Progress(line, name, fields)
+	}
 }
 
 // ClientOption changes a Client's local transport boundary.
@@ -80,6 +105,11 @@ func WithMaxPageCount(limit int) ClientOption { return WithMaxPages(limit) }
 // limiter disables throttling.
 func WithThrottle(limiter *throttle.Limiter) ClientOption {
 	return func(c *Client) { c.lim = limiter }
+}
+
+// WithReporter sets the progress reporter. A nil reporter stops all reports.
+func WithReporter(reporter Reporter) ClientOption {
+	return func(c *Client) { c.reporter = reporter }
 }
 
 // NewClient creates a client with the supplied API origin and HTTP client.
@@ -187,6 +217,13 @@ func (c *Client) ListCollections(ctx context.Context) ([]Collection, error) {
 			seen[collection.ID] = struct{}{}
 			collections = append(collections, collection)
 		}
+		// Each page waits for the rate limiter, so the person needs a sign
+		// that the search continues.
+		c.reportProgress(
+			fmt.Sprintf("Discovering collections: page %d/%d, %d found.", page, last, len(collections)),
+			"discovery_page",
+			map[string]any{"page": page, "of": last, "collections": len(collections)},
+		)
 		if page == last {
 			return collections, nil
 		}

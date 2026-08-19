@@ -67,6 +67,7 @@ Copy one of those names into `--cookies-from-browser` to select that profile.
 - `--sync-existing` checks completed Collections again. It records Collections, Sets, References, and Placements that are no longer in Pixieset. It does not delete saved files.
 - `--verify` checks each Placement against its saved SHA-256 checksum. Pixiegrabber downloads a file again if the file is missing or has changed.
 - `--yes` accepts the download plan without a prompt.
+- `--quiet` hides the progress lines. Pixiegrabber still writes the run log.
 - `--concurrency N` sets the number of References that Pixiegrabber can download at the same time. The default is `4`.
 - `--user-agent VALUE` sets the User-Agent header. If you do not use this flag, Pixiegrabber gets the value from the selected browser.
 - `--interval DURATION` sets the minimum time between Pixieset API and image requests. The default is `0`, which turns this delay off. Use a value such as `2s` to reduce the request rate.
@@ -83,6 +84,7 @@ Pixiegrabber uses this directory structure:
 
 ```text
 <output>/
+  pixiegrabber-run.log
   <collection-name>--<collection-id>/
     collection.json
     <set-name>--<set-id>/
@@ -90,6 +92,29 @@ Pixiegrabber uses this directory structure:
 ```
 
 Pixiegrabber locks the output directory while it runs. A second process cannot use the same directory at the same time. Pixiegrabber rejects symbolic links and reparse points in the output path.
+
+## The run log
+
+A large account takes a long time to read. Pixiegrabber shows what it does while it works:
+
+```
+Discovering collections: page 22/22, 521 found.
+[  1/521] Itau | Bad Bunny: 2 sets, 131 images
+[  2/521] TIMELESS: 1 set, 200 images
+Downloading: 40/131 done, 0 failed.
+```
+
+It also writes `pixiegrabber-run.log` at the output root, with one JSON object for each line. Use it to see what a finished run did:
+
+```sh
+jq -c 'select(.ev == "collection")' pixiegrabber-run.log | tail
+jq -c 'select(.ev == "download_failed")' pixiegrabber-run.log
+jq -c 'select(.ev == "run_end")' pixiegrabber-run.log
+```
+
+The log holds counts, identifiers and states only. It never holds a URL, a cookie, a token or an S3 key. Each run replaces the log of the run before it.
+
+Press `Ctrl-C` to stop. Pixiegrabber saves the log, releases the lock, and exits. Run it again to continue.
 
 ## S3 object layout
 

@@ -63,6 +63,7 @@ Optional flags:
 - `--sync-existing`: Refresh completed Collections and represent remote removals without deleting local files.
 - `--verify`: Check every local Placement against its saved SHA-256 checksum and restore missing or changed files.
 - `--yes`: Accept the download plan without an interactive prompt.
+- `--quiet`: Hide the progress lines. Pixiegrabber still writes the run log.
 - `--concurrency N`: Set concurrent Reference downloads. The default is `4`.
 - `--user-agent VALUE`: Override the User-Agent detected from the selected browser and its installed version.
 - `--interval DURATION`: Set the minimum interval between Pixieset API calls. The default is `0`, which disables throttling. Use a value such as `2s` to avoid flooding the Pixieset servers.
@@ -111,6 +112,9 @@ Only documented normalized fields cross from `internal/pixieset` into the manife
 10. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`. When `--interval` is set, wait at least that long between every Pixieset API call.
 11. Persist resumable manifest state with atomic writes.
 12. Exit nonzero when authentication, discovery, or any Reference fails.
+13. Show progress while the run continues: one line for each dashboard page, one line for each Collection, and a count while files download. Report each failed Reference and each retry wait of two seconds or more.
+14. Write one JSON object for each event to `pixiegrabber-run.log` at the output root, so that a person or a program can read what the run did. The log holds counts, identifiers and states. It never holds a URL, a cookie, a token or an S3 key. Each run replaces the log of the run before it.
+15. Stop cleanly on an interrupt signal, save the log, release the output lock, and exit with 130.
 
 An empty Collection gets a manifest and a completed state.
 

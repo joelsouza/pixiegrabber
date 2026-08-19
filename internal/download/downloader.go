@@ -112,6 +112,9 @@ type Options struct {
 	// Limiter spaces out media requests. A nil limiter disables throttling.
 	Limiter *throttle.Limiter
 
+	// Reporter records progress. A nil reporter stops all reports.
+	Reporter Reporter
+
 	// MediaOrigin overrides the fixed production media origin. It is a test
 	// seam; production callers leave it empty.
 	MediaOrigin string
@@ -124,12 +127,23 @@ type Options struct {
 }
 
 // Downloader downloads and installs planned image References.
+// Reporter records progress. The runlog Logger satisfies it, so this package
+// needs no import of the logger and the logger needs none of this package.
+type Reporter interface {
+	// Event records one event for a program to read.
+	Event(name string, fields map[string]any)
+	// Progress writes one line for the person and records the same event. An
+	// empty line writes nothing to the terminal.
+	Progress(line, name string, fields map[string]any)
+}
+
 type Downloader struct {
 	client      *http.Client
 	concurrency int
 	maxAttempts int
 	mediaOrigin string
 	limiter     *throttle.Limiter
+	reporter    Reporter
 	sleeper     sleeperFunc
 	clock       func() time.Time
 }
@@ -182,6 +196,7 @@ func New(options Options) (*Downloader, error) {
 		maxAttempts: attempts,
 		mediaOrigin: origin,
 		limiter:     options.Limiter,
+		reporter:    options.Reporter,
 		sleeper:     sleep,
 		clock:       clock,
 	}, nil
@@ -215,6 +230,7 @@ func (d *Downloader) Download(ctx context.Context, s store.Store, work []archive
 	if workers > len(work) {
 		workers = len(work)
 	}
+	progress := newDownloadProgress(d.reporter, len(work), d.clock)
 	var group sync.WaitGroup
 	group.Add(workers)
 	for n := 0; n < workers; n++ {
@@ -222,9 +238,11 @@ func (d *Downloader) Download(ctx context.Context, s store.Store, work []archive
 			defer group.Done()
 			for index := range jobs {
 				results[index] = d.process(ctx, s, work[index])
+				progress.done(results[index])
 			}
 		}()
 	}
+	defer progress.finish()
 	for i := range work {
 		select {
 		case jobs <- i:
