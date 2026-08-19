@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"image"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,7 +81,23 @@ var syntheticJPEG = func() []byte {
 	return buf.Bytes()
 }()
 
-func apiServer(t *testing.T, mediaURL, videos string) *httptest.Server {
+// syntheticMP4 is a minimal MP4: one ftyp box of 20 bytes (big-endian size,
+// "ftyp", major brand "isom", minor version 0, compatible brand "mp42"). The
+// "mp42" brand is required so http.DetectContentType reports video/mp4.
+var syntheticMP4 = func() []byte {
+	var buf bytes.Buffer
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], 20)
+	buf.Write(size[:])
+	buf.WriteString("ftyp")
+	buf.WriteString("isom")
+	var version [4]byte
+	buf.Write(version[:])
+	buf.WriteString("mp42")
+	return buf.Bytes()
+}()
+
+func apiServer(t *testing.T, mediaURL, videos string, videoCount int) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -89,7 +107,7 @@ func apiServer(t *testing.T, mediaURL, videos string) *httptest.Server {
 		case "/api/v1/collections/1/galleries":
 			_, _ = io.WriteString(w, `{"data":[{"id":"2","collection_id":"1","name":"Set","description":"","photo_count":1,"video_count":0,"rank":2}]}`)
 		case "/api/v1/galleries/2":
-			_, _ = io.WriteString(w, `{"data":{"id":"2","collection_id":"1","name":"Set","description":"","photo_count":1,"video_count":0,"rank":2,"photos":[{"id":"3","collection_id":"1","gallery_id":"2","name":"Photo","description":"","mime_type":"image/jpeg","ext":"jpg","size":12,"width":20,"height":30,"rank":1,"path_xxlarge":"`+mediaURL+`"}],"videos":`+videos+`}}`)
+			_, _ = io.WriteString(w, `{"data":{"id":"2","collection_id":"1","name":"Set","description":"","photo_count":1,"video_count":`+strconv.Itoa(videoCount)+`,"rank":2,"photos":[{"id":"3","collection_id":"1","gallery_id":"2","name":"Photo","description":"","mime_type":"image/jpeg","ext":"jpg","size":12,"width":20,"height":30,"rank":1,"path_xxlarge":"`+mediaURL+`"}],"videos":`+videos+`}}`)
 		default:
 			t.Errorf("unexpected API path %q", r.URL.Path)
 		}
@@ -125,7 +143,7 @@ func TestRunWritesTheRunLogAndProgressLines(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -174,7 +192,7 @@ func TestQuietRunStillWritesTheRunLog(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -206,7 +224,7 @@ func TestRunLogRecordsADeclinedPlan(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -230,7 +248,7 @@ func TestRunFirstRunDownloadsAndWritesManifest(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -268,7 +286,7 @@ func TestRunVideoStopWritesDiagnosticAndDoesNotDownload(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", `[{"kind":"video","safe":true}]`)
+	api := apiServer(t, media.URL+"/photo.jpg", `[{"kind":"video","safe":true}]`, 1)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -283,6 +301,14 @@ func TestRunVideoStopWritesDiagnosticAndDoesNotDownload(t *testing.T) {
 	if !strings.Contains(stdout.String(), "pixiegrabber-unsupported-video.json") {
 		t.Fatalf("stdout did not print the diagnostic path: %q", stdout.String())
 	}
+	// The run log keeps counts and IDs only; no diagnostic path or URL.
+	data, readErr := os.ReadFile(filepath.Join(output, runlog.LogFilename))
+	if readErr != nil {
+		t.Fatalf("run log missing: %v", readErr)
+	}
+	if strings.Contains(string(data), "pixiegrabber-unsupported-video") || strings.Contains(string(data), "://") {
+		t.Fatalf("run log holds a diagnostic path or URL:\n%s", data)
+	}
 	if mediaCalls.Load() != 0 {
 		t.Fatalf("media server was called %d times during video stop", mediaCalls.Load())
 	}
@@ -294,7 +320,7 @@ func TestRunConfirmationGatesWork(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -324,7 +350,7 @@ func TestRunResumeSkipsHealthyCollection(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	output := tempOutput(t)
@@ -342,5 +368,96 @@ func TestRunResumeSkipsHealthyCollection(t *testing.T) {
 	}
 	if mediaCalls.Load() != 1 {
 		t.Fatalf("resume media calls = %d, want 1 (healthy skip)", mediaCalls.Load())
+	}
+}
+
+func TestRunDownloadsVideosWhenEnabled(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/PLAYBACKID/high.mp4" {
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write(syntheticMP4)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	video := `{"id":"4","provider_id":3,"name":"Clip","width":1080,"height":1620,"mux_status":2,"metadata":"{\"status\":\"ready\",\"duration\":8.8,\"mp4_support\":\"standard\",\"static_renditions\":{\"status\":\"ready\",\"files\":[{\"name\":\"high.mp4\",\"ext\":\"mp4\",\"width\":1080,\"height\":1620,\"filesize\":2152769}]}}","video_source":"` + media.URL + `/PLAYBACKID.m3u8?token=synthetic-video-token"}`
+	api := apiServer(t, media.URL+"/photo.jpg", "["+video+"]", 1)
+	defer api.Close()
+
+	output := tempOutput(t)
+	options := testOptions(output, api.URL, media.URL)
+	options.Videos = true
+	if err := Run(context.Background(), options, io.Discard, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+
+	videoFile := filepath.Join(output, "Collection--1", "Set--2", "Clip--4.mp4")
+	data, err := os.ReadFile(videoFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, syntheticMP4) {
+		t.Fatal("downloaded video does not match the fixture")
+	}
+
+	fs, err := outputfs.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	m, err := manifest.Load(fs, "Collection--1/collection.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var videoRef *manifest.Reference
+	for i := range m.References {
+		if m.References[i].ID == "4" {
+			videoRef = &m.References[i]
+		}
+	}
+	if videoRef == nil || videoRef.MediaType != "video" || videoRef.DownloadState != manifest.DownloadComplete || videoRef.SelectedQuality != "high" {
+		t.Fatalf("video reference = %#v", videoRef)
+	}
+}
+
+func TestRunRecordsUnavailableVideoAsMissing(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(syntheticJPEG)
+	}))
+	defer media.Close()
+	dead := `{"id":"5","provider_id":3,"name":"Dead","width":0,"height":0,"mux_status":3,"metadata":"{\"status\":\"timed_out\"}","video_source":""}`
+	api := apiServer(t, media.URL+"/photo.jpg", "["+dead+"]", 1)
+	defer api.Close()
+
+	output := tempOutput(t)
+	options := testOptions(output, api.URL, media.URL)
+	options.Videos = true
+	if err := Run(context.Background(), options, io.Discard, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+
+	fs, err := outputfs.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	m, err := manifest.Load(fs, "Collection--1/collection.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deadRef *manifest.Reference
+	for i := range m.References {
+		if m.References[i].ID == "5" {
+			deadRef = &m.References[i]
+		}
+	}
+	if deadRef == nil || deadRef.MediaType != "video" || deadRef.PresenceState != manifest.PresenceMissing || len(deadRef.Placements) != 0 || deadRef.DownloadState != manifest.DownloadPending {
+		t.Fatalf("dead video reference = %#v", deadRef)
+	}
+	if _, statErr := os.Stat(filepath.Join(output, "Collection--1", "Set--2", "Photo--3.jpg")); statErr != nil {
+		t.Fatalf("photo not downloaded: %v", statErr)
 	}
 }

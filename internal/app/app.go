@@ -37,6 +37,7 @@ type Options struct {
 	Output             string
 	SyncExisting       bool
 	Verify             bool
+	Videos             bool
 	Yes                bool
 	Concurrency        int
 	UserAgent          string
@@ -235,11 +236,11 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 				"sets": len(fullSets), "images": images,
 			},
 		)
-		if err := archive.CheckVideos(s, fullSets); err != nil {
+		if err := archive.ClassifyVideos(s, fullSets, archive.Options{Videos: options.Videos}); err != nil {
 			if errors.Is(err, archive.ErrUnsupportedVideo) {
 				var videoErr *archive.UnsupportedVideoError
 				if errors.As(err, &videoErr) {
-					fmt.Fprintf(stdout, "unsupported video detected; diagnostic: %s\n", videoErr.Path())
+					fmt.Fprintf(stdout, "unsupported video detected; sanitized diagnostic: %s\n", videoErr.Path())
 				}
 			}
 			outcome = "unsupported_video"
@@ -253,6 +254,7 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 		plan, err := archive.Build(s, collection, fullSets, previous, archive.Options{
 			SyncExisting: options.SyncExisting,
 			Verify:       options.Verify,
+			Videos:       options.Videos,
 			Now:          time.Now().UTC(),
 		})
 		if err != nil {
@@ -297,6 +299,9 @@ func Run(ctx context.Context, options Options, stdout io.Writer, stdin io.Reader
 
 	displayPlan(stdout, plans)
 	logger.Event("plan", planFields(plans))
+	if fields, ok := videoFields(plans); ok {
+		logger.Event("video", fields)
+	}
 
 	if !options.Yes {
 		fmt.Fprint(stdout, "Proceed? [y/N] ")
@@ -349,10 +354,15 @@ func count(value int, noun string) string {
 // displayPlan writes for the person.
 func planFields(plans []collectionPlan) map[string]any {
 	references, placements := 0, 0
+	videoReferences := 0
 	var sourceBytes int64
+	var videoBytes int64
 	for _, cp := range plans {
 		for _, ref := range cp.plan.Manifest.References {
 			references++
+			if ref.MediaType == "video" {
+				videoReferences++
+			}
 			for _, placement := range ref.Placements {
 				if placement.PresenceState == manifest.PresencePresent {
 					placements++
@@ -361,14 +371,48 @@ func planFields(plans []collectionPlan) map[string]any {
 		}
 		for _, work := range cp.plan.Downloads {
 			sourceBytes += work.SourceBytes
+			if work.MediaKind == archive.MediaKindVideo {
+				videoBytes += work.SourceBytes
+			}
 		}
 	}
 	return map[string]any{
-		"collections":  len(plans),
-		"references":   references,
-		"placements":   placements,
-		"source_bytes": sourceBytes,
+		"collections":      len(plans),
+		"references":       references,
+		"placements":       placements,
+		"source_bytes":     sourceBytes,
+		"video_references": videoReferences,
+		"video_bytes":      videoBytes,
 	}
+}
+
+// videoFields summarizes the planned video References for the run log. It
+// carries counts, IDs and presence states only; never a URL.
+func videoFields(plans []collectionPlan) (map[string]any, bool) {
+	var ids []string
+	var states []string
+	missing := 0
+	for _, cp := range plans {
+		for _, ref := range cp.plan.Manifest.References {
+			if ref.MediaType != "video" {
+				continue
+			}
+			ids = append(ids, ref.ID)
+			states = append(states, string(ref.PresenceState))
+			if ref.PresenceState == manifest.PresenceMissing {
+				missing++
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"count":   len(ids),
+		"missing": missing,
+		"ids":     ids,
+		"states":  states,
+	}, true
 }
 
 // selectStore returns the backend for a run. An explicit Store seam wins;
@@ -393,12 +437,18 @@ func selectStore(options Options) (store.Store, error) {
 
 func displayPlan(stdout io.Writer, plans []collectionPlan) {
 	collectionCount := len(plans)
-	referenceCount := 0
+	imageReferences := 0
+	videoReferences := 0
 	placementCount := 0
 	var sourceBytes int64
+	var videoBytes int64
 	for _, cp := range plans {
 		for _, ref := range cp.plan.Manifest.References {
-			referenceCount++
+			if ref.MediaType == "video" {
+				videoReferences++
+			} else {
+				imageReferences++
+			}
 			for _, placement := range ref.Placements {
 				if placement.PresenceState == manifest.PresencePresent {
 					placementCount++
@@ -407,12 +457,17 @@ func displayPlan(stdout io.Writer, plans []collectionPlan) {
 		}
 		for _, work := range cp.plan.Downloads {
 			sourceBytes += work.SourceBytes
+			if work.MediaKind == archive.MediaKindVideo {
+				videoBytes += work.SourceBytes
+			}
 		}
 	}
 	fmt.Fprintf(stdout, "Collections: %d\n", collectionCount)
-	fmt.Fprintf(stdout, "Image references: %d\n", referenceCount)
+	fmt.Fprintf(stdout, "Image references: %d\n", imageReferences)
+	fmt.Fprintf(stdout, "Video references: %d\n", videoReferences)
 	fmt.Fprintf(stdout, "Placement files: %d\n", placementCount)
 	fmt.Fprintf(stdout, "Source bytes: %d\n", sourceBytes)
+	fmt.Fprintf(stdout, "Video bytes: %d\n", videoBytes)
 }
 
 func loadPreviousManifest(s store.Store, collection pixieset.Collection) (*manifest.Manifest, error) {

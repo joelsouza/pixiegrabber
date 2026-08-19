@@ -26,6 +26,7 @@ func main() {
 	flag.StringVar(&options.Output, "output", "", "select the local output root (required unless --s3)")
 	flag.BoolVar(&options.SyncExisting, "sync-existing", false, "refresh completed Collections and represent remote removals without deleting local files")
 	flag.BoolVar(&options.Verify, "verify", false, "check every local Placement against its saved SHA-256 checksum and restore missing or changed files")
+	flag.BoolVar(&options.Videos, "videos", false, "download videos from supported sources")
 	flag.BoolVar(&options.Yes, "yes", false, "accept the download plan without an interactive prompt")
 	flag.BoolVar(&options.Quiet, "quiet", false, "hide the progress lines; the run log is still written")
 	flag.IntVar(&options.Concurrency, "concurrency", 4, "set concurrent Reference downloads")

@@ -235,6 +235,10 @@ func normalizeVideo(item wireVideo, expectedCollection, expectedSet string, base
 		path := parsed.Path
 		playbackID := path[1 : len(path)-len(".m3u8")]
 		token := parsed.Query().Get("token")
+		// The validated origin is stream.mux.com in production and the
+		// loopback test server in tests, so composing from it keeps the
+		// downloader origin check consistent with the source.
+		origin := parsed.Scheme + "://" + parsed.Host
 		type pair struct {
 			file    muxFile
 			variant ImageVariant
@@ -250,7 +254,7 @@ func normalizeVideo(item wireVideo, expectedCollection, expectedSet string, base
 				file: file,
 				variant: ImageVariant{
 					Quality: file.Name[:len(file.Name)-len(".mp4")],
-					URL:     fmt.Sprintf("https://stream.mux.com/%s/%s?%s", playbackID, file.Name, query.Encode()),
+					URL:     fmt.Sprintf("%s/%s/%s?%s", origin, playbackID, file.Name, query.Encode()),
 				},
 			})
 		}

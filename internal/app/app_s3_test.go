@@ -107,7 +107,7 @@ func TestRunS3ModeWritesTheRunLogToTheBucket(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	if err := Run(context.Background(), s3Options(api.URL, media.URL, endpoint), io.Discard, strings.NewReader("")); err != nil {
@@ -138,7 +138,7 @@ func TestRunS3ModeDownloadsToBucket(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", "[]")
+	api := apiServer(t, media.URL+"/photo.jpg", "[]", 0)
 	defer api.Close()
 
 	endpoint, client := s3Fixture(t)
@@ -203,7 +203,7 @@ func TestRunS3ModeVideoStopWritesDiagnosticToBucket(t *testing.T) {
 		_, _ = w.Write(syntheticJPEG)
 	}))
 	defer media.Close()
-	api := apiServer(t, media.URL+"/photo.jpg", `[{"kind":"video","safe":true}]`)
+	api := apiServer(t, media.URL+"/photo.jpg", `[{"kind":"video","safe":true}]`, 1)
 	defer api.Close()
 
 	endpoint, client := s3Fixture(t)
@@ -218,7 +218,7 @@ func TestRunS3ModeVideoStopWritesDiagnosticToBucket(t *testing.T) {
 
 	keys := listKeys(t, client)
 	if _, ok := keys["pixiegrabber-unsupported-video.json"]; !ok {
-		t.Fatalf("bucket missing diagnostic; keys = %v", keys)
+		t.Fatalf("bucket missing %q; keys = %v", "pixiegrabber-unsupported-video.json", keys)
 	}
 	if data := getObject(t, client, "pixiegrabber-unsupported-video.json"); len(data) == 0 {
 		t.Fatal("diagnostic object is empty")
