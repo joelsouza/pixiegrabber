@@ -91,12 +91,3 @@ func (s Set) FirstUnrecognizedVideo() ([]byte, bool) {
 	}
 	return append([]byte(nil), s.unrecognized[0]...), true
 }
-
-// AllVideos returns copies of every raw video object for diagnostics.
-func (s Set) AllVideos() [][]byte {
-	all := make([][]byte, 0, len(s.videos))
-	for _, video := range s.videos {
-		all = append(all, append([]byte(nil), video...))
-	}
-	return all
-}

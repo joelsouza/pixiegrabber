@@ -809,8 +809,8 @@ func TestGetSetRejectsUnrecognizedVideos(t *testing.T) {
 		video string
 	}{
 		"metadata over byte bound": {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"` + strings.Repeat("a", maxVideoMetadataBytes+1) + `","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
-		"unsafe rendition name":   {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"../../evil.mp4\"}]}}","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
-		"wrong video host":        {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"high.mp4\"}]}}","video_source":"https://images.pixieset.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
+		"unsafe rendition name":    {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"../../evil.mp4\"}]}}","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
+		"wrong video host":         {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"high.mp4\"}]}}","video_source":"https://images.pixieset.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {

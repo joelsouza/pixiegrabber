@@ -45,15 +45,15 @@ type wireCollection struct {
 }
 
 type wireSet struct {
-	ID           wireID            `json:"id"`
-	CollectionID wireID            `json:"collection_id"`
-	Name         string            `json:"name"`
-	Description  string            `json:"description"`
-	PhotoCount   wireInt           `json:"photo_count"`
-	VideoCount   wireInt           `json:"video_count"`
-	Rank         wireInt           `json:"rank"`
-	Photos       []wirePhoto  `json:"photos"`
-	Videos       []wireVideo  `json:"videos"`
+	ID           wireID      `json:"id"`
+	CollectionID wireID      `json:"collection_id"`
+	Name         string      `json:"name"`
+	Description  string      `json:"description"`
+	PhotoCount   wireInt     `json:"photo_count"`
+	VideoCount   wireInt     `json:"video_count"`
+	Rank         wireInt     `json:"rank"`
+	Photos       []wirePhoto `json:"photos"`
+	Videos       []wireVideo `json:"videos"`
 }
 
 type wirePhoto struct {

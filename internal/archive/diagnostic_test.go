@@ -18,10 +18,10 @@ import (
 	"pixiegrabber/internal/pixieset"
 )
 
-func TestCheckVideosNoVideosDoesNotCreateOutput(t *testing.T) {
+func TestClassifyVideosNoVideosDoesNotCreateOutput(t *testing.T) {
 	fs := openTestFS(t)
 	root := filepath.Dir(mustDisplayPath(t, fs, diagnosticFilename))
-	if err := CheckVideos(fs, []pixieset.Set{{ID: "1"}}); err != nil {
+	if err := ClassifyVideos(fs, []pixieset.Set{{ID: "1"}}, Options{Videos: false}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(root)
@@ -35,14 +35,14 @@ func TestCheckVideosNoVideosDoesNotCreateOutput(t *testing.T) {
 	}
 }
 
-func TestCheckVideosWritesFirstOnlyAndReturnsTypedError(t *testing.T) {
+func TestClassifyVideosWritesDiagnosticAndReturnsTypedError(t *testing.T) {
 	secret := "synthetic-video-token-7f3c"
 	first := videoSet(t, fmt.Sprintf(`{"kind":"video","name":"synthetic-name","url":"https://user:%s@media.example/video.mp4?sig=%s#fragment","width":1920},{"kind":"video","name":"second-video-secret"}`, secret, secret))
 	second := videoSet(t, `{"kind":"video","name":"third-video"}`)
 	fs := openTestFS(t)
-	err := CheckVideos(fs, []pixieset.Set{{ID: "no-video"}, first, second})
+	err := ClassifyVideos(fs, []pixieset.Set{{ID: "no-video"}, first, second}, Options{Videos: false})
 	if err == nil || !errors.Is(err, ErrUnsupportedVideo) {
-		t.Fatalf("CheckVideos() error = %v", err)
+		t.Fatalf("ClassifyVideos() error = %v", err)
 	}
 	var typed *UnsupportedVideoError
 	if !errors.As(err, &typed) || typed == nil {
@@ -400,7 +400,7 @@ func TestSanitizeVideoJSONIsDeterministicAndReplacementIsAtomic(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"old":true}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video","old":false}`)}); !errors.Is(err, ErrUnsupportedVideo) {
+	if err := ClassifyVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video","old":false}`)}, Options{Videos: false}); !errors.Is(err, ErrUnsupportedVideo) {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -457,7 +457,7 @@ func TestDiagnosticRejectsWrongTypeRootAndTarget(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, diagnosticFilename), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video"}`)}); err == nil {
+	if err := ClassifyVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video"}`)}, Options{Videos: false}); err == nil {
 		t.Fatal("directory diagnostic target was accepted")
 	}
 }
@@ -482,7 +482,7 @@ func TestDiagnosticRejectsSymlinkRootAndTarget(t *testing.T) {
 	if err := os.Symlink(linkTarget, target); err != nil {
 		t.Skipf("symbolic links are not supported: %v", err)
 	}
-	if err := CheckVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video"}`)}); err == nil {
+	if err := ClassifyVideos(fs, []pixieset.Set{videoSet(t, `{"kind":"video"}`)}, Options{Videos: false}); err == nil {
 		t.Fatal("symbolic-link diagnostic target was accepted")
 	}
 }

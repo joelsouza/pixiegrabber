@@ -12,7 +12,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"pixiegrabber/internal/pixieset"
 	"pixiegrabber/internal/store"
 )
 
@@ -71,29 +70,6 @@ func (e *UnsupportedVideoError) Error() string {
 }
 
 func (e *UnsupportedVideoError) Unwrap() error { return ErrUnsupportedVideo }
-
-// CheckVideos stops archive work before image plans or downloads start when a
-// Set contains an unsupported video. It writes one sanitized sample from the
-// first such Set. Sets without videos do not touch the output root. The caller
-// must hold the output-root lock; Task 6 calls this immediately after each
-// GetSet, before it builds any plan or download work.
-func CheckVideos(s store.Store, sets []pixieset.Set) error {
-	for _, set := range sets {
-		if !set.HasVideos() {
-			continue
-		}
-		raw, ok := set.FirstVideo()
-		if !ok {
-			return errors.New("read unsupported video diagnostic: video data is unavailable")
-		}
-		path, err := writeVideoDiagnostic(s, raw)
-		if err != nil {
-			return err
-		}
-		return &UnsupportedVideoError{DiagnosticPath: path}
-	}
-	return nil
-}
 
 func writeVideoDiagnostic(s store.Store, raw []byte) (string, error) {
 	value, err := sanitizeVideoJSON(raw)
