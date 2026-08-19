@@ -32,6 +32,7 @@ const (
 type Options struct {
 	SyncExisting bool
 	Verify       bool
+	Videos       bool
 
 	// Now is used for manifest timestamps. A zero value uses the current UTC
 	// time. The value is converted to UTC before it is stored.
@@ -48,9 +49,18 @@ type Plan struct {
 	Renames        []Rename
 }
 
+// MediaKind selects the download validation for one Reference.
+type MediaKind string
+
+const (
+	MediaKindImage MediaKind = "image"
+	MediaKindVideo MediaKind = "video"
+)
+
 // DownloadWork is the work for one Collection-scoped Reference.
 type DownloadWork struct {
 	ReferenceID  string
+	MediaKind    MediaKind
 	Variants     []pixieset.ImageVariant
 	SourceBytes  int64
 	Destinations []Destination
@@ -86,7 +96,7 @@ func Build(s store.Store, source pixieset.Collection, sets []pixieset.Set, previ
 	if err != nil {
 		return Plan{}, err
 	}
-	if prior != nil && classification == ClassificationHealthy && !options.SyncExisting {
+	if prior != nil && classification == ClassificationHealthy && !options.SyncExisting && !(options.Videos && sourceHasVideos(sets)) {
 		// A healthy default run is a discovery skip. Do not validate or merge
 		// newly discovered Sets because the caller did not request a sync.
 		prior.Collection.LastDiscoveryAt = timePointer(now)
@@ -127,6 +137,53 @@ func Build(s store.Store, source pixieset.Collection, sets []pixieset.Set, previ
 
 	plannedDir := collectionComponent(next.Collection.Name, next.Collection.ID)
 	return Plan{Classification: classification, CollectionDir: plannedDir, Manifest: next, Downloads: downloads, Renames: renames}, nil
+}
+
+// ClassifyVideos stops archive work before image plans or downloads start
+// when a Set contains a video that cannot be planned. With videos disabled,
+// any video stops the run with a sanitized diagnostic. With videos enabled,
+// an unrecognized record stops the run; recognized records are planned or
+// recorded as missing by Build. The caller must hold the output-root lock.
+func ClassifyVideos(s store.Store, sets []pixieset.Set, options Options) error {
+	if !options.Videos {
+		for _, set := range sets {
+			if !set.HasVideos() {
+				continue
+			}
+			raw, ok := set.FirstVideo()
+			if !ok {
+				continue
+			}
+			path, err := writeVideoDiagnostic(s, raw)
+			if err != nil {
+				return err
+			}
+			return &UnsupportedVideoError{DiagnosticPath: path}
+		}
+		return nil
+	}
+	for _, set := range sets {
+		raw, ok := set.FirstUnrecognizedVideo()
+		if !ok {
+			continue
+		}
+		path, err := writeVideoDiagnostic(s, raw)
+		if err != nil {
+			return err
+		}
+		return &UnsupportedVideoError{DiagnosticPath: path}
+	}
+	return nil
+}
+
+// sourceHasVideos reports whether any discovered Set carries a video record.
+func sourceHasVideos(sets []pixieset.Set) bool {
+	for _, set := range sets {
+		if set.HasVideos() {
+			return true
+		}
+	}
+	return false
 }
 
 // MarkSourceMissing makes a no-work plan for a Collection that was not in
@@ -170,7 +227,47 @@ func MarkSourceMissing(s store.Store, previous manifest.Manifest, now time.Time)
 
 type currentReference struct {
 	photo  pixieset.Photo
+	video  pixieset.Video
 	setIDs []string
+}
+
+// mediaFacts is the media-agnostic subset of a currentReference that the
+// planner needs to name a Reference and its local files.
+type mediaFacts struct {
+	name      string
+	id        string
+	extension string
+	variants  []pixieset.ImageVariant
+	size      int64
+}
+
+// facts returns the media facts for the reference, preferring the video when
+// one is present.
+func (ref *currentReference) facts() mediaFacts {
+	if ref.video.ID != "" {
+		return mediaFacts{
+			name:      ref.video.Name,
+			id:        ref.video.ID,
+			extension: ref.video.Extension,
+			variants:  ref.video.Variants,
+			size:      ref.video.Size,
+		}
+	}
+	return mediaFacts{
+		name:      ref.photo.Name,
+		id:        ref.photo.ID,
+		extension: ref.photo.Extension,
+		variants:  ref.photo.ImageVariants,
+		size:      ref.photo.Size,
+	}
+}
+
+// rankAndID returns the media rank and ID used to order the reference.
+func (ref *currentReference) rankAndID() (int, string) {
+	if ref.video.ID != "" {
+		return ref.video.Rank, ref.video.ID
+	}
+	return ref.photo.Rank, ref.photo.ID
 }
 
 func validateSets(source pixieset.Collection, sets []pixieset.Set) ([]pixieset.Set, map[string]pixieset.Set, error) {
@@ -229,16 +326,32 @@ func aggregateReferences(sets []pixieset.Set) ([]currentReference, error) {
 			}
 			byID[photo.ID] = &currentReference{photo: clonePhoto(photo), setIDs: []string{set.ID}}
 		}
+		for _, video := range set.Videos {
+			if existing, ok := byID[video.ID]; ok {
+				if existing.video.ID == "" {
+					return nil, fmt.Errorf("photo %q and video %q share an ID", existing.photo.ID, video.ID)
+				}
+				if !sameIntrinsicVideoMetadata(existing.video, video) {
+					return nil, fmt.Errorf("video %q has conflicting normalized metadata", video.ID)
+				}
+				existing.video.Variants = mergeVariants(existing.video.Variants, video.Variants)
+				existing.setIDs = append(existing.setIDs, set.ID)
+				continue
+			}
+			byID[video.ID] = &currentReference{video: cloneVideo(video), setIDs: []string{set.ID}}
+		}
 	}
 	result := make([]currentReference, 0, len(byID))
 	for _, reference := range byID {
 		result = append(result, *reference)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].photo.Rank != result[j].photo.Rank {
-			return result[i].photo.Rank < result[j].photo.Rank
+		leftRank, leftID := result[i].rankAndID()
+		rightRank, rightID := result[j].rankAndID()
+		if leftRank != rightRank {
+			return leftRank < rightRank
 		}
-		return result[i].photo.ID < result[j].photo.ID
+		return leftID < rightID
 	})
 	return result, nil
 }
@@ -405,12 +518,25 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 	var downloads []DownloadWork
 	var renames []Rename
 	for _, current := range currentReferences {
-		reference, existed := oldReferences[current.photo.ID]
-		delete(oldReferences, current.photo.ID)
+		facts := current.facts()
+		reference, existed := oldReferences[facts.id]
+		delete(oldReferences, facts.id)
 		if !existed {
-			reference = manifest.Reference{ID: current.photo.ID, Placements: []manifest.Placement{}}
+			reference = manifest.Reference{ID: facts.id, Placements: []manifest.Placement{}}
 		}
-		applyPhotoMetadata(&reference, current.photo)
+		applyReferenceMetadata(&reference, current.photo, current.video)
+		if current.video.ID != "" && len(current.video.Variants) == 0 {
+			// A well-formed video with no usable source becomes a missing
+			// Reference with no new Placements. Old Placements are retained as
+			// missing so local files stay tracked.
+			reference.PresenceState = manifest.PresenceMissing
+			for i := range reference.Placements {
+				reference.Placements[i].PresenceState = manifest.PresenceMissing
+			}
+			setReferenceDownloadState(&reference, existed)
+			next.References = append(next.References, reference)
+			continue
+		}
 		reference.PresenceState = manifest.PresencePresent
 
 		oldPlacements := make(map[string]manifest.Placement, len(reference.Placements))
@@ -418,12 +544,12 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 			oldPlacements[placement.SetID] = placement
 		}
 		reference.Placements = make([]manifest.Placement, 0, len(current.setIDs)+len(oldPlacements))
-		work := DownloadWork{ReferenceID: reference.ID, Variants: cloneVariants(current.photo.ImageVariants), SourceBytes: current.photo.Size}
+		work := DownloadWork{ReferenceID: reference.ID, MediaKind: mediaKind(&current), Variants: cloneVariants(facts.variants), SourceBytes: facts.size}
 		trustedPresent := 0
 		untrustedReset := false
 		for _, setID := range current.setIDs {
 			sourceSet := setByID[setID]
-			relativePath := portablePlacementPath(sourceSet, current.photo)
+			relativePath := portablePlacementPath(sourceSet, facts)
 			placement, existed := oldPlacements[setID]
 			delete(oldPlacements, setID)
 			if !existed {
@@ -557,9 +683,30 @@ func merge(source pixieset.Collection, orderedSets []pixieset.Set, setByID map[s
 	return next, downloads, renames, nil
 }
 
-func applyPhotoMetadata(reference *manifest.Reference, photo pixieset.Photo) {
+func applyReferenceMetadata(reference *manifest.Reference, photo pixieset.Photo, video pixieset.Video) {
 	// SHA256 is historical executor state. The planner only establishes local
 	// Placement trust and leaves the Reference checksum for the executor.
+	if video.ID != "" {
+		reference.ID = video.ID
+		reference.Name = video.Name
+		reference.Description = ""
+		reference.SourceOrder = video.Rank
+		reference.SourceCreated = nil
+		reference.SourceUpdated = nil
+		reference.CapturedAt = nil
+		reference.MediaType = "video"
+		reference.OriginalFilename = video.Name
+		reference.Width = video.Width
+		reference.Height = video.Height
+		if video.DurationSeconds > 0 {
+			reference.DurationSeconds = &video.DurationSeconds
+		} else {
+			reference.DurationSeconds = nil
+		}
+		reference.MIMEType = video.MIMEType
+		reference.SelectedQuality = selectedQuality(video.Variants)
+		return
+	}
 	reference.ID = photo.ID
 	reference.Name = photo.Name
 	reference.Description = photo.Description
@@ -590,12 +737,12 @@ func selectedQuality(variants []pixieset.ImageVariant) string {
 	case "medium":
 		return "path_medium"
 	default:
-		return ""
+		return variants[0].Quality
 	}
 }
 
-func portablePlacementPath(set pixieset.Set, photo pixieset.Photo) string {
-	return path.Join(paths.SetComponent(set.Name, set.ID), paths.ReferenceComponent(photo.Name, photo.ID, photo.Extension))
+func portablePlacementPath(set pixieset.Set, facts mediaFacts) string {
+	return path.Join(paths.SetComponent(set.Name, set.ID), paths.ReferenceComponent(facts.name, facts.id, facts.extension))
 }
 
 func setReferenceDownloadState(reference *manifest.Reference, existed bool) {
@@ -618,7 +765,7 @@ func setReferenceDownloadState(reference *manifest.Reference, existed bool) {
 	}
 	if present == 0 {
 		if !existed {
-			reference.DownloadState = manifest.DownloadComplete
+			reference.DownloadState = manifest.DownloadPending
 		}
 		return
 	}
@@ -801,6 +948,17 @@ func sameIntrinsicPhotoMetadata(left, right pixieset.Photo) bool {
 	return sameTime(left.CaptureDate, right.CaptureDate)
 }
 
+func sameIntrinsicVideoMetadata(left, right pixieset.Video) bool {
+	return left.ID == right.ID && left.CollectionID == right.CollectionID && left.Name == right.Name && left.Width == right.Width && left.Height == right.Height && left.DurationSeconds == right.DurationSeconds && left.MIMEType == right.MIMEType && left.Extension == right.Extension && left.Size == right.Size && left.Rank == right.Rank
+}
+
+func mediaKind(ref *currentReference) MediaKind {
+	if ref.video.ID != "" {
+		return MediaKindVideo
+	}
+	return MediaKindImage
+}
+
 var variantOrder = map[string]int{
 	"xxlarge": 0,
 	"xlarge":  1,
@@ -837,6 +995,11 @@ func clonePhoto(photo pixieset.Photo) pixieset.Photo {
 	photo.ImageVariants = cloneVariants(photo.ImageVariants)
 	photo.CaptureDate = cloneTime(photo.CaptureDate)
 	return photo
+}
+
+func cloneVideo(video pixieset.Video) pixieset.Video {
+	video.Variants = cloneVariants(video.Variants)
+	return video
 }
 
 func cloneVariants(variants []pixieset.ImageVariant) []pixieset.ImageVariant {

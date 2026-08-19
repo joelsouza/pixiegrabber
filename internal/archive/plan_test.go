@@ -1,13 +1,18 @@
 package archive
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +40,41 @@ func testPhoto(collectionID, setID, id, name string, rank int) pixieset.Photo {
 		MIMEType: "image/jpeg", Extension: "jpg", Size: 3, Width: 10, Height: 20, Rank: rank,
 		ImageVariants: []pixieset.ImageVariant{{Quality: "xxlarge", URL: "https://images.pixieset.com/private/" + id + "/xxlarge"}, {Quality: "large", URL: "https://images.pixieset.com/private/" + id + "/large"}},
 	}
+}
+
+func testVideo(collectionID, setID, id, name string, rank int, variants ...pixieset.ImageVariant) pixieset.Video {
+	return pixieset.Video{
+		ID: id, CollectionID: collectionID, SetID: setID, Name: name,
+		MIMEType: "video/mp4", Extension: "mp4", Size: 3, Width: 10, Height: 20, Rank: rank,
+		MuxStatus: 2, Variants: variants,
+	}
+}
+
+func photoFacts(photo pixieset.Photo) mediaFacts {
+	return mediaFacts{name: photo.Name, id: photo.ID, extension: photo.Extension, variants: photo.ImageVariants, size: photo.Size}
+}
+
+// setWithPhotoAndVideo builds a Set through the pixieset client so the
+// unexported raw-video bytes that HasVideos reads are populated alongside the
+// normalized Video. The photo and video records are real-shaped and normalize.
+func setWithPhotoAndVideo(t *testing.T, collectionID, setID, name string, rank int) pixieset.Set {
+	t.Helper()
+	photo := `{"id":"501","collection_id":"` + collectionID + `","gallery_id":"` + setID + `","name":"Photo","description":"","mime_type":"image/jpeg","ext":"jpg","size":3,"width":10,"height":20,"rank":1,"path_medium":"//images.pixieset.com/photo.jpg"}`
+	video := `{"id":"601","provider_id":3,"name":"Clip","width":10,"height":20,"mux_status":2,"metadata":"{\"status\":\"ready\",\"duration\":8.8,\"static_renditions\":{\"files\":[{\"name\":\"high.mp4\",\"width\":10,\"height\":20,\"filesize\":3}]}}","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"id":"`+setID+`","collection_id":"`+collectionID+`","name":"`+name+`","photo_count":1,"rank":`+strconv.Itoa(rank)+`,"photos":[`+photo+`],"videos":[`+video+`]}}`)
+	}))
+	defer server.Close()
+	client, err := pixieset.NewClient(server.URL, server.Client(), pixieset.WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := client.GetSet(context.Background(), collectionID, setID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set
 }
 
 func displayPath(t *testing.T, fs *outputfs.FS, rel string) string {
@@ -539,7 +579,7 @@ func TestBuildRejectsExistingNewAndRenameTargets(t *testing.T) {
 	previous := first.Manifest
 	previous.Collection.RunState = manifest.RunIncomplete
 	newSets := []pixieset.Set{testSet(source.ID, "11", "New", 1, testPhoto(source.ID, "11", "501", "New photo", 1))}
-	newPath := portablePlacementPath(newSets[0], newSets[0].Photos[0])
+	newPath := portablePlacementPath(newSets[0], photoFacts(newSets[0].Photos[0]))
 	target := displayPath(t, fs2, path.Join(first.CollectionDir, newPath))
 	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 		t.Fatal(err)
@@ -655,7 +695,7 @@ func TestBuildRejectsRootMigrationPlacementAndDownloadCollisions(t *testing.T) {
 	newSource := oldSource
 	newSource.Name = "New"
 	newSets := []pixieset.Set{testSet(newSource.ID, "11", "New set", 1, testPhoto(newSource.ID, "11", "501", "New photo", 1))}
-	placementTarget := displayPath(t, fs, path.Join(first.CollectionDir, portablePlacementPath(newSets[0], newSets[0].Photos[0])))
+	placementTarget := displayPath(t, fs, path.Join(first.CollectionDir, portablePlacementPath(newSets[0], photoFacts(newSets[0].Photos[0]))))
 	if err := os.MkdirAll(filepath.Dir(placementTarget), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +711,7 @@ func TestBuildRejectsRootMigrationPlacementAndDownloadCollisions(t *testing.T) {
 	completePlanFile(t, fs2, &first, "abc")
 	previous = first.Manifest
 	newSet := testSet(newSource.ID, "12", "Added set", 2, testPhoto(newSource.ID, "12", "502", "Added photo", 2))
-	downloadTarget := displayPath(t, fs2, path.Join(first.CollectionDir, portablePlacementPath(newSet, newSet.Photos[0])))
+	downloadTarget := displayPath(t, fs2, path.Join(first.CollectionDir, portablePlacementPath(newSet, photoFacts(newSet.Photos[0]))))
 	if err := os.MkdirAll(filepath.Dir(downloadTarget), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -786,7 +826,7 @@ func TestBuildPlansCaseOnlyCollectionAndPlacementRenames(t *testing.T) {
 	caseInsensitive := newCollectionErr == nil && os.SameFile(oldCollectionInfo, newCollectionInfo)
 	if caseInsensitive {
 		oldPlacementPath := displayPath(t, fs, path.Join(first.CollectionDir, previous.References[0].Placements[0].Path))
-		newPlacementPath := displayPath(t, fs, path.Join(first.CollectionDir, portablePlacementPath(newSets[0], newSets[0].Photos[0])))
+		newPlacementPath := displayPath(t, fs, path.Join(first.CollectionDir, portablePlacementPath(newSets[0], photoFacts(newSets[0].Photos[0]))))
 		oldPlacementInfo, err := os.Stat(oldPlacementPath)
 		if err != nil {
 			t.Fatal(err)
@@ -835,5 +875,92 @@ func TestManifestNeedsWorkScansPresentPlacementsOfMissingReferences(t *testing.T
 	m.References[0].PresenceState = manifest.PresenceMissing
 	if !manifestNeedsWork(m) {
 		t.Fatal("manifestNeedsWork skipped a present Placement under a missing Reference")
+	}
+}
+
+func TestBuildPlansLiveVideosAndRecordsDeadOnesAsMissing(t *testing.T) {
+	fs := openTestFS(t)
+	source := testCollection()
+	photo := testPhoto(source.ID, "11", "501", "Photo", 1)
+	live := testVideo(source.ID, "11", "601", "Clip", 2,
+		pixieset.ImageVariant{Quality: "high", URL: "https://stream.mux.com/PLAYBACKID/high.mp4?token=synthetic-video-token"},
+		pixieset.ImageVariant{Quality: "medium", URL: "https://stream.mux.com/PLAYBACKID/medium.mp4?token=synthetic-video-token"},
+	)
+	dead := testVideo(source.ID, "11", "602", "Dead", 3)
+	set := testSet(source.ID, "11", "Set", 1, photo)
+	set.Videos = []pixieset.Video{live, dead}
+	plan := buildTest(t, fs, source, []pixieset.Set{set}, nil, Options{Now: testNow, Videos: true})
+	if len(plan.Manifest.References) != 3 {
+		t.Fatalf("references = %d, want 3", len(plan.Manifest.References))
+	}
+	var liveRef, deadRef *manifest.Reference
+	for i := range plan.Manifest.References {
+		switch plan.Manifest.References[i].ID {
+		case "601":
+			liveRef = &plan.Manifest.References[i]
+		case "602":
+			deadRef = &plan.Manifest.References[i]
+		}
+	}
+	if liveRef == nil || deadRef == nil {
+		t.Fatalf("references = %#v", plan.Manifest.References)
+	}
+	if liveRef.MediaType != "video" || liveRef.PresenceState != manifest.PresencePresent || len(liveRef.Placements) != 1 || liveRef.Placements[0].PresenceState != manifest.PresencePresent {
+		t.Fatalf("live video reference = %#v", liveRef)
+	}
+	if len(plan.Downloads) != 2 {
+		t.Fatalf("downloads = %d, want 2", len(plan.Downloads))
+	}
+	var liveWork *DownloadWork
+	for i := range plan.Downloads {
+		if plan.Downloads[i].ReferenceID == "601" {
+			liveWork = &plan.Downloads[i]
+		}
+	}
+	if liveWork == nil || liveWork.MediaKind != MediaKindVideo {
+		t.Fatalf("live video download work = %#v", plan.Downloads)
+	}
+	if deadRef.MediaType != "video" || deadRef.PresenceState != manifest.PresenceMissing || len(deadRef.Placements) != 0 || deadRef.DownloadState != manifest.DownloadPending {
+		t.Fatalf("dead video reference = %#v", deadRef)
+	}
+	// A fresh build with a pending live video download is incomplete.
+	if plan.Manifest.Collection.RunState != manifest.RunIncomplete {
+		t.Fatalf("run state = %q, want incomplete", plan.Manifest.Collection.RunState)
+	}
+}
+
+func TestBuildWithVideosEnabledReplansHealthyCollection(t *testing.T) {
+	fs := openTestFS(t)
+	source := testCollection()
+	photo := testPhoto(source.ID, "11", "501", "Photo", 1)
+	first := buildTest(t, fs, source, []pixieset.Set{testSet(source.ID, "11", "Set", 1, photo)}, nil, Options{Now: testNow})
+	completePlanFile(t, fs, &first, "abc")
+	previous := first.Manifest
+
+	set := setWithPhotoAndVideo(t, source.ID, "11", "Set", 1)
+
+	withVideos := buildTest(t, fs, source, []pixieset.Set{set}, &previous, Options{Now: testNow, Videos: true})
+	if withVideos.Classification != ClassificationHealthy {
+		t.Fatalf("classification = %q, want healthy", withVideos.Classification)
+	}
+	if len(withVideos.Manifest.References) != 2 {
+		t.Fatalf("references = %d, want 2", len(withVideos.Manifest.References))
+	}
+	var videoRef *manifest.Reference
+	for i := range withVideos.Manifest.References {
+		if withVideos.Manifest.References[i].ID == "601" {
+			videoRef = &withVideos.Manifest.References[i]
+		}
+	}
+	if videoRef == nil || videoRef.PresenceState != manifest.PresencePresent || len(videoRef.Placements) != 1 {
+		t.Fatalf("video reference = %#v", videoRef)
+	}
+	if len(withVideos.Downloads) != 1 || withVideos.Downloads[0].ReferenceID != "601" || withVideos.Downloads[0].MediaKind != MediaKindVideo {
+		t.Fatalf("downloads = %#v", withVideos.Downloads)
+	}
+
+	withoutVideos := buildTest(t, fs, source, []pixieset.Set{set}, &previous, Options{Now: testNow})
+	if withoutVideos.Classification != ClassificationHealthy || len(withoutVideos.Downloads) != 0 {
+		t.Fatalf("no-videos plan = %#v", withoutVideos)
 	}
 }
