@@ -52,8 +52,8 @@ type wireSet struct {
 	PhotoCount   wireInt           `json:"photo_count"`
 	VideoCount   wireInt           `json:"video_count"`
 	Rank         wireInt           `json:"rank"`
-	Photos       []wirePhoto       `json:"photos"`
-	Videos       []json.RawMessage `json:"videos"`
+	Photos       []wirePhoto  `json:"photos"`
+	Videos       []wireVideo  `json:"videos"`
 }
 
 type wirePhoto struct {
@@ -73,6 +73,51 @@ type wirePhoto struct {
 	PathXLarge   string          `json:"path_xlarge"`
 	PathLarge    string          `json:"path_large"`
 	PathMedium   string          `json:"path_medium"`
+}
+
+type wireVideo struct {
+	ID          wireID  `json:"id"`
+	ProviderID  wireInt `json:"provider_id"`
+	Name        string  `json:"name"`
+	Width       wireInt `json:"width"`
+	Height      wireInt `json:"height"`
+	MuxStatus   wireInt `json:"mux_status"`
+	Metadata    string  `json:"metadata"`
+	VideoSource string  `json:"video_source"`
+	Rank        wireInt `json:"rank"`
+	raw         []byte
+}
+
+// UnmarshalJSON decodes a video record leniently. The raw bytes are always
+// retained so the fail-closed diagnostic still has something to write; if the
+// inner decode fails, the fields are left zeroed and nil is returned, and
+// normalizeVideo rejects the record.
+func (video *wireVideo) UnmarshalJSON(data []byte) error {
+	video.raw = append([]byte(nil), data...)
+	var decoded struct {
+		ID          wireID  `json:"id"`
+		ProviderID  wireInt `json:"provider_id"`
+		Name        string  `json:"name"`
+		Width       wireInt `json:"width"`
+		Height      wireInt `json:"height"`
+		MuxStatus   wireInt `json:"mux_status"`
+		Metadata    string  `json:"metadata"`
+		VideoSource string  `json:"video_source"`
+		Rank        wireInt `json:"rank"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil
+	}
+	video.ID = decoded.ID
+	video.ProviderID = decoded.ProviderID
+	video.Name = decoded.Name
+	video.Width = decoded.Width
+	video.Height = decoded.Height
+	video.MuxStatus = decoded.MuxStatus
+	video.Metadata = decoded.Metadata
+	video.VideoSource = decoded.VideoSource
+	video.Rank = decoded.Rank
+	return nil
 }
 
 type wireID struct {

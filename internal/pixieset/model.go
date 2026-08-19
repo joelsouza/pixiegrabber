@@ -24,7 +24,9 @@ type Set struct {
 	VideoCount   int     `json:"video_count"`
 	Rank         int     `json:"rank"`
 	Photos       []Photo `json:"photos,omitempty"`
+	Videos       []Video `json:"videos,omitempty"`
 	videos       [][]byte
+	unrecognized [][]byte
 }
 
 // ImageVariant is one source image quality. URL is transient source data and
@@ -51,6 +53,25 @@ type Photo struct {
 	ImageVariants []ImageVariant `json:"image_variants,omitempty"`
 }
 
+// Video is a normalized Mux video record. Variants are the MP4 renditions,
+// ordered by descending width. URL is transient source data and is not
+// serialized with normalized models.
+type Video struct {
+	ID              string         `json:"id"`
+	CollectionID    string         `json:"collection_id"`
+	SetID           string         `json:"set_id"`
+	Name            string         `json:"name"`
+	Width           int            `json:"width"`
+	Height          int            `json:"height"`
+	DurationSeconds float64        `json:"duration_seconds,omitempty"`
+	MIMEType        string         `json:"mime_type"`
+	Extension       string         `json:"ext"`
+	Size            int64          `json:"size"`
+	Rank            int            `json:"rank"`
+	MuxStatus       int            `json:"-"`
+	Variants        []ImageVariant `json:"image_variants,omitempty"`
+}
+
 // HasVideos reports whether the Set contains unsupported video objects.
 func (s Set) HasVideos() bool { return len(s.videos) != 0 }
 
@@ -60,4 +81,22 @@ func (s Set) FirstVideo() ([]byte, bool) {
 		return nil, false
 	}
 	return append([]byte(nil), s.videos[0]...), true
+}
+
+// FirstUnrecognizedVideo returns a copy of the first raw video object that
+// could not be normalized, for diagnostics.
+func (s Set) FirstUnrecognizedVideo() ([]byte, bool) {
+	if len(s.unrecognized) == 0 {
+		return nil, false
+	}
+	return append([]byte(nil), s.unrecognized[0]...), true
+}
+
+// AllVideos returns copies of every raw video object for diagnostics.
+func (s Set) AllVideos() [][]byte {
+	all := make([][]byte, 0, len(s.videos))
+	for _, video := range s.videos {
+		all = append(all, append([]byte(nil), video...))
+	}
+	return all
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"mime"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -119,7 +120,13 @@ func normalizeSet(item wireSet, expectedCollection, expectedSet string, content 
 		set.Photos = append(set.Photos, photo)
 	}
 	for _, video := range item.Videos {
-		set.videos = append(set.videos, append([]byte(nil), video...))
+		set.videos = append(set.videos, append([]byte(nil), video.raw...))
+		normalized, err := normalizeVideo(video, collectionID, id, baseURL)
+		if err != nil {
+			set.unrecognized = append(set.unrecognized, append([]byte(nil), video.raw...))
+			continue
+		}
+		set.Videos = append(set.Videos, normalized)
 	}
 	return set, nil
 }
@@ -177,6 +184,126 @@ func normalizePhoto(item wirePhoto, expectedCollection, expectedSet string, base
 		return Photo{}, err
 	}
 	return Photo{ID: id, CollectionID: collectionID, SetID: setID, Name: item.Name, Description: item.Description, MIMEType: item.MIMEType, Extension: item.Extension, Size: size, Width: int(width), Height: int(height), Rank: int(rank), CaptureDate: captureDate, ImageVariants: variants}, nil
+}
+
+func normalizeVideo(item wireVideo, expectedCollection, expectedSet string, baseURL *url.URL) (Video, error) {
+	id, err := sourceID(item.ID, "video")
+	if err != nil {
+		return Video{}, err
+	}
+	if item.ProviderID.present && item.ProviderID.value != muxProviderID {
+		return Video{}, errors.New("video provider is unsupported")
+	}
+	if err := requiredString(item.Name, "video name"); err != nil {
+		return Video{}, err
+	}
+	muxStatus, err := requiredInteger(item.MuxStatus, "video status", false)
+	if err != nil {
+		return Video{}, err
+	}
+	width, _, err := integerField(item.Width, "video width", false)
+	if err != nil {
+		return Video{}, err
+	}
+	height, _, err := integerField(item.Height, "video height", false)
+	if err != nil {
+		return Video{}, err
+	}
+	rank, _, err := integerField(item.Rank, "video rank", false)
+	if err != nil {
+		return Video{}, err
+	}
+	var asset muxAsset
+	if item.Metadata != "" {
+		parsed, err := parseMuxMetadata(item.Metadata)
+		if err != nil {
+			return Video{}, err
+		}
+		asset = parsed
+	}
+	variants := make([]ImageVariant, 0)
+	bestSize := int64(0)
+	if item.VideoSource != "" {
+		validated, err := normalizeVideoURL(item.VideoSource, baseURL)
+		if err != nil {
+			return Video{}, err
+		}
+		parsed, err := url.Parse(validated)
+		if err != nil {
+			return Video{}, err
+		}
+		path := parsed.Path
+		playbackID := path[1 : len(path)-len(".m3u8")]
+		token := parsed.Query().Get("token")
+		type pair struct {
+			file    muxFile
+			variant ImageVariant
+		}
+		pairs := make([]pair, 0, len(asset.StaticRenditions.Files))
+		for _, file := range asset.StaticRenditions.Files {
+			if !validRenditionName(file.Name) {
+				return Video{}, errors.New("video rendition name is invalid")
+			}
+			query := url.Values{}
+			query.Set("token", token)
+			pairs = append(pairs, pair{
+				file: file,
+				variant: ImageVariant{
+					Quality: file.Name[:len(file.Name)-len(".mp4")],
+					URL:     fmt.Sprintf("https://stream.mux.com/%s/%s?%s", playbackID, file.Name, query.Encode()),
+				},
+			})
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].file.Width > pairs[j].file.Width })
+		for _, p := range pairs {
+			variants = append(variants, p.variant)
+		}
+		if len(pairs) > 0 {
+			bestSize = pairs[0].file.FileSize
+		}
+	}
+	return Video{ID: id, CollectionID: expectedCollection, SetID: expectedSet, Name: item.Name, Width: int(width), Height: int(height), DurationSeconds: asset.Duration, MIMEType: "video/mp4", Extension: "mp4", Size: bestSize, Rank: int(rank), MuxStatus: int(muxStatus), Variants: variants}, nil
+}
+
+func normalizeVideoURL(value string, baseURL *url.URL) (string, error) {
+	if len(value) > maxStringBytes {
+		return "", errors.New("video URL is too long")
+	}
+	if strings.HasPrefix(value, "//") {
+		value = "https:" + value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil {
+		return "", errors.New("video URL is invalid")
+	}
+	localFixture := baseURL != nil && isLoopbackHost(baseURL.Hostname()) && isLoopbackHost(parsed.Hostname()) && strings.EqualFold(baseURL.Hostname(), parsed.Hostname())
+	if !strings.EqualFold(parsed.Scheme, "https") && !localFixture {
+		return "", errors.New("video URL must use HTTPS")
+	}
+	if !localFixture && parsed.Port() != "" && parsed.Port() != "443" {
+		return "", errors.New("video URL has an invalid port")
+	}
+	if !localFixture && !strings.EqualFold(parsed.Hostname(), "stream.mux.com") {
+		return "", errors.New("video URL host is invalid")
+	}
+	path := parsed.Path
+	if !strings.HasPrefix(path, "/") || !strings.HasSuffix(path, ".m3u8") {
+		return "", errors.New("video URL path is invalid")
+	}
+	segment := path[1 : len(path)-len(".m3u8")]
+	if segment == "" || strings.Contains(segment, "/") {
+		return "", errors.New("video URL path is invalid")
+	}
+	for _, character := range segment {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return "", errors.New("video URL path is invalid")
+	}
+	if strings.EqualFold(parsed.Scheme, "https") {
+		parsed.Scheme = "https"
+	}
+	return parsed.String(), nil
 }
 
 func sourceID(value wireID, field string) (string, error) {

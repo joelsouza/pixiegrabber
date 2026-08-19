@@ -108,7 +108,7 @@ func TestClientEndpointPathsAndMultiPageAccumulation(t *testing.T) {
 			if r.URL.RequestURI() != "/api/v1/galleries/2?expand=photos.starred%2Cvideos" {
 				t.Errorf("Set-content request URI = %q", r.URL.RequestURI())
 			}
-			_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+			_, _ = io.WriteString(w, setResponse("0", "", "[]", 0))
 		default:
 			t.Errorf("unexpected request URI %q", r.URL.RequestURI())
 		}
@@ -321,7 +321,7 @@ func TestClientValidatesIDsDuplicatesAndPhotoFields(t *testing.T) {
 			if name == "count mismatch" {
 				count = "2"
 			}
-			_, _ = io.WriteString(w, setResponse(count, test.photo, "[]"))
+			_, _ = io.WriteString(w, setResponse(count, test.photo, "[]", 0))
 		}))
 		client, _ := NewClient(server.URL, server.Client(), WithUserAgent("test"))
 		_, err := client.GetSet(context.Background(), "1", "2")
@@ -434,7 +434,7 @@ func TestClientRejectsMissingRequiredNumericFields(t *testing.T) {
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, setResponse("1", string(encoded), "[]"))
+				_, _ = io.WriteString(w, setResponse("1", string(encoded), "[]", 0))
 			}))
 			defer server.Close()
 			client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
@@ -536,7 +536,7 @@ func TestClientRejectsDuplicateSetsPhotosAndBadRelationships(t *testing.T) {
 			_, _ = io.WriteString(w, `{"data":[`+set+`,`+set+`]}`)
 			return
 		}
-		_, _ = io.WriteString(w, setResponse("2", validPhoto("3", "2")+","+validPhoto("3", "2"), "[]"))
+		_, _ = io.WriteString(w, setResponse("2", validPhoto("3", "2")+","+validPhoto("3", "2"), "[]", 0))
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL, server.Client(), WithUserAgent("test"))
@@ -601,7 +601,7 @@ func TestClientThrottleSpacesSequentialRequests(t *testing.T) {
 	const interval = 30 * time.Millisecond
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+		_, _ = io.WriteString(w, setResponse("0", "", "[]", 0))
 	}))
 	defer server.Close()
 	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"), WithThrottle(throttle.New(interval)))
@@ -625,7 +625,7 @@ func TestClientThrottleSpacesSequentialRequests(t *testing.T) {
 func TestClientThrottleZeroIntervalDoesNotSlow(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+		_, _ = io.WriteString(w, setResponse("0", "", "[]", 0))
 	}))
 	defer server.Close()
 	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"), WithThrottle(throttle.New(0)))
@@ -653,7 +653,7 @@ func TestClientRetries429HonoringRetryAfter(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, setResponse("0", "", "[]"))
+		_, _ = io.WriteString(w, setResponse("0", "", "[]", 0))
 	}))
 	defer server.Close()
 	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
@@ -773,6 +773,71 @@ func TestGetSetCountsTheVideosItReceives(t *testing.T) {
 	}
 }
 
+func TestGetSetNormalizesAVideo(t *testing.T) {
+	video := `{"id":"133871182","provider_id":3,"name":"Clip","width":1080,"height":1620,"mux_status":2,"metadata":"{\"status\":\"ready\",\"duration\":8.8,\"mp4_support\":\"standard\",\"static_renditions\":{\"status\":\"ready\",\"files\":[{\"name\":\"high.mp4\",\"ext\":\"mp4\",\"width\":1080,\"height\":1620,\"filesize\":2152769},{\"name\":\"medium.mp4\",\"ext\":\"mp4\",\"width\":480,\"height\":720,\"filesize\":243234},{\"name\":\"low.mp4\",\"ext\":\"mp4\",\"width\":270,\"height\":404,\"filesize\":106595}]}}","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, setResponse("0", "", "["+video+"]", 1))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := client.GetSet(context.Background(), "1", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Videos) != 1 {
+		t.Fatalf("videos = %d, want 1", len(set.Videos))
+	}
+	v := set.Videos[0]
+	if v.ID != "133871182" || v.Name != "Clip" || v.Width != 1080 || v.Height != 1620 || v.MIMEType != "video/mp4" || v.Extension != "mp4" || v.Size != 2152769 || v.DurationSeconds != 8.8 || v.MuxStatus != 2 {
+		t.Fatalf("video = %#v", v)
+	}
+	if len(v.Variants) != 3 || v.Variants[0].Quality != "high" || v.Variants[1].Quality != "medium" || v.Variants[2].Quality != "low" {
+		t.Fatalf("variants = %#v", v.Variants)
+	}
+	serialized, _ := json.Marshal(set)
+	if strings.Contains(string(serialized), "synthetic-video-token") || strings.Contains(string(serialized), "stream.mux.com") {
+		t.Fatalf("URL leaked into serialized Set: %s", serialized)
+	}
+}
+
+func TestGetSetRejectsUnrecognizedVideos(t *testing.T) {
+	tests := map[string]struct {
+		video string
+	}{
+		"metadata over byte bound": {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"` + strings.Repeat("a", maxVideoMetadataBytes+1) + `","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
+		"unsafe rendition name":   {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"../../evil.mp4\"}]}}","video_source":"https://stream.mux.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
+		"wrong video host":        {video: `{"id":"1","provider_id":3,"name":"Clip","mux_status":2,"metadata":"{\"status\":\"ready\",\"static_renditions\":{\"files\":[{\"name\":\"high.mp4\"}]}}","video_source":"https://images.pixieset.com/PLAYBACKID.m3u8?token=synthetic-video-token"}`},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, setResponse("0", "", "["+test.video+"]", 1))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, server.Client(), WithUserAgent("test"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			set, err := client.GetSet(context.Background(), "1", "2")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(set.Videos) != 0 {
+				t.Fatalf("videos = %d, want 0", len(set.Videos))
+			}
+			raw, ok := set.FirstUnrecognizedVideo()
+			if !ok || !strings.Contains(string(raw), `"id":"1"`) {
+				t.Fatalf("unrecognized video = %q, %v", raw, ok)
+			}
+		})
+	}
+}
+
 func TestListSetsKeepsARankThatPixiesetSends(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -801,8 +866,8 @@ func dashboardResponseWithMeta(meta string) string {
 	return `{"data":{"data":{"collections":[]},"meta":` + meta + `}}`
 }
 
-func setResponse(count, photos, videos string) string {
-	return `{"data":{"id":"2","collection_id":"1","name":"Set","description":"","photo_count":` + count + `,"video_count":0,"rank":1,"photos":[` + photos + `],"videos":` + videos + `}}`
+func setResponse(count, photos, videos string, videoCount int) string {
+	return `{"data":{"id":"2","collection_id":"1","name":"Set","description":"","photo_count":` + count + `,"video_count":` + stringInt(videoCount) + `,"rank":1,"photos":[` + photos + `],"videos":` + videos + `}}`
 }
 
 func validPhoto(id, setID string) string {
