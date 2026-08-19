@@ -1,6 +1,6 @@
 # Pixiegrabber
 
-Pixiegrabber downloads images from Pixieset Client Gallery Collections that you can access. It stores the images on your computer or in an S3-compatible bucket. It also writes a JSON manifest for each Collection.
+Pixiegrabber downloads images and videos from Pixieset Client Gallery Collections that you can access. It stores the images on your computer or in an S3-compatible bucket. It also writes a JSON manifest for each Collection.
 
 ## Terms
 
@@ -8,7 +8,7 @@ This README uses the following terms:
 
 - Collection: one Pixieset client gallery. A Collection can contain Sets.
 - Set: a named group of References in a Collection.
-- Reference: an image and the metadata that describes its source.
+- Reference: an image or video and the metadata that describes its source.
 - Placement: the location of a Reference in a Set. One Reference can have a Placement in more than one Set.
 
 ## Requirements
@@ -66,6 +66,7 @@ Copy one of those names into `--cookies-from-browser` to select that profile.
 - `--cookies-from-browser [BROWSER[:PROFILE][::CONTAINER]]` limits the search for your Pixieset session. Use `chrome` to search one browser. Use `chrome:Profile 1` to select one profile, by name or by directory path. Use `firefox:default-release::Work` to select one Firefox container. Use `::none` for cookies that belong to no container.
 - `--sync-existing` checks completed Collections again. It records Collections, Sets, References, and Placements that are no longer in Pixieset. It does not delete saved files.
 - `--verify` checks each Placement against its saved SHA-256 checksum. Pixiegrabber downloads a file again if the file is missing or has changed.
+- `--videos` downloads the videos in each Collection. Videos download at up to 1080p. Without this flag, Pixiegrabber stops at the first video it cannot plan. A video that Pixieset cannot serve becomes a missing Reference, and the run still completes.
 - `--yes` accepts the download plan without a prompt.
 - `--quiet` hides the progress lines. Pixiegrabber still writes the run log.
 - `--concurrency N` sets the number of References that Pixiegrabber can download at the same time. The default is `4`.

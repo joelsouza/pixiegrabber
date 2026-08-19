@@ -2,7 +2,7 @@
 
 ## Objective
 
-Pixiegrabber is a command-line tool that preserves authorized Pixieset Client Gallery Collections. It discovers Collections in the active Pixieset workspace, downloads each image Reference, and writes one normalized JSON manifest for each Collection. It stores output in a local directory or in an S3-compatible bucket.
+Pixiegrabber is a command-line tool that preserves authorized Pixieset Client Gallery Collections. It discovers Collections in the active Pixieset workspace, downloads each image and video Reference, and writes one normalized JSON manifest for each Collection. It stores output in a local directory or in an S3-compatible bucket.
 
 The first version processes new and incomplete Collections by default. It can safely synchronize completed Collections without deleting local files.
 
@@ -16,11 +16,11 @@ The first version processes new and incomplete Collections by default. It can sa
 - Download the largest listed image variant, starting with `path_xxlarge` and falling back through smaller named variants.
 - Use one Collection-scoped Reference per Pixieset media ID.
 - Create one Placement and one local file for each Set that contains a Reference.
-- Detect non-empty video responses, write one sanitized diagnostic sample, and stop before image downloads.
+- Download video References when `--videos` is set. Without `--videos`, or when a video record cannot be planned, write one sanitized diagnostic sample and stop before image downloads.
 - Use Pixieset's internal JSON endpoints directly, as recorded in [ADR 0001](./adr/0001-use-pixieset-internal-api.md).
 - Never change remote Pixieset data.
 
-The first version does not accept Collection URLs, filter Collections, download videos, retain raw API responses, or support more than the active workspace.
+The first version does not accept Collection URLs, filter Collections, or support more than the active workspace. It does not download video posters or thumbnails.
 
 ## Runtime
 
@@ -62,6 +62,7 @@ Optional flags:
 - `--cookies-from-browser [BROWSER[:PROFILE][::CONTAINER]]`: Import the active Pixieset session. With no flag, Pixiegrabber searches every supported browser. A browser name alone selects the profile and the Firefox container that hold the active session. PROFILE accepts a profile name or a directory path.
 - `--sync-existing`: Refresh completed Collections and represent remote removals without deleting local files.
 - `--verify`: Check every local Placement against its saved SHA-256 checksum and restore missing or changed files.
+- `--videos`: Download video References from their MP4 renditions. Videos are capped at 1080p. Without this flag, a run stops at the first video it cannot plan.
 - `--yes`: Accept the download plan without an interactive prompt.
 - `--quiet`: Hide the progress lines. Pixiegrabber still writes the run log.
 - `--concurrency N`: Set concurrent Reference downloads. The default is `4`.
@@ -90,9 +91,10 @@ Pixiegrabber maps Pixieset's API term `gallery` to the domain term **Set**.
 - `GET /api/v1/collections/{collection_id}/galleries` returns the Sets in one Collection. Each Set includes its ID, Collection ID, name, description, image count, and video count.
 - `GET /api/v1/galleries/{set_id}?expand=photos.starred%2Cvideos` returns one Set with `photos` and `videos` arrays. This response is thinner than the Set list: it sends no video count, and its description can be `null`. The `videos` array gives the video count.
 - An image record includes its media ID, Collection ID, Set ID, name, MIME type, extension, byte size, dimensions, rank, capture date, and named media variants through `path_xxlarge`.
+- A video record uses Mux: `provider_id` 3, `mux_status`, and a `video_source` of the form `https://stream.mux.com/{playback_id}.m3u8?token={token}`. The same token authorizes the static MP4 renditions at `https://stream.mux.com/{playback_id}/{rendition}?token={token}`, where `rendition` is `high.mp4`, `medium.mp4`, or `low.mp4`. Mux serves videos at up to 1080p, and its signed URLs live 24 hours and are never persisted.
 - Only an image record has a rank. A Collection record and a Set record have none, so the order of the Sets in the Set list gives their display order.
 
-The API origin is exactly `https://galleries.pixieset.com` on the default HTTPS port. The media origin is exactly `https://images.pixieset.com` on the default HTTPS port. API and media clients reject redirects. The media client has no cookie jar and sends no authorization, CSRF, Origin, or Referer header.
+The API origin is exactly `https://galleries.pixieset.com` on the default HTTPS port. The media origin is exactly `https://images.pixieset.com` on the default HTTPS port, and video media comes from exactly `https://stream.mux.com`. API and media clients reject redirects. The media client has no cookie jar and sends no authorization, CSRF, Origin, or Referer header.
 
 Media URLs can be protocol-relative. Pixiegrabber normalizes them to HTTPS before validation. Pixieset can return invalid sentinel dates, including zero dates and negative-year timestamps. Pixiegrabber normalizes these values to JSON `null` instead of failing the Collection.
 
@@ -106,7 +108,7 @@ Only documented normalized fields cross from `internal/pixieset` into the manife
 4. Discover every dashboard-listing page and deduplicate Collections by Pixieset ID.
 5. Classify Collections as new, incomplete, complete, or missing locally expected files.
 6. Load every Set in every selected Collection to build a complete plan before starting any image worker.
-7. If a non-empty `videos` array appears, write one sanitized sample to `<output>/pixiegrabber-unsupported-video.json` and exit nonzero before image downloads.
+7. Without `--videos`, any video stops the run: write one sanitized sample to `<output>/pixiegrabber-unsupported-video.json` and exit nonzero before image downloads. With `--videos`, plan and download video References; a video with no usable source becomes a missing Reference with no Placement, and the run still exits zero.
 8. Show planned Collection, image Reference, Placement file, and source-byte counts. Require confirmation unless `--yes` is present.
 9. Process new and incomplete Collections. Restore missing local files. Skip other completed Collections unless `--sync-existing` is present.
 10. Download with four workers by default. Use bounded retries with backoff and honor `Retry-After`. When `--interval` is set, wait at least that long between every Pixieset API call.
@@ -191,15 +193,14 @@ The manifest does not store raw source payloads, source selection state, source 
 
 Manifest updates use a same-directory temporary file and replacement that is atomic against process interruption on supported local filesystems. A terminated process must leave either the previous valid manifest or the next valid manifest. Power-loss durability is not guaranteed.
 
-## Unsupported Video Diagnostic
+## Video Diagnostic
 
-- Do not download videos in the first version.
-- Stop at the first non-empty `videos` response before image downloads begin.
+- Stop when a run without `--videos` meets any video, or when a video record cannot be planned.
 - Write one sanitized value-shaped JSON sample to `<output>/pixiegrabber-unsupported-video.json`.
 - Preserve field names, JSON value types, and allowlisted media facts. Replace all other scalar values with type-compatible placeholders. Remove URL queries, fragments, user information, and personal path segments.
 - Create the diagnostic with owner-only permissions where the operating system supports them.
-- Print the diagnostic path and exit nonzero so a later implementation session can add the verified video contract.
-- Never log or persist the raw video object.
+- Print the diagnostic path and exit nonzero.
+- A video with no usable source becomes a Reference with presence state missing and no Placement. It does not stop the run.
 
 ## Project Structure
 
@@ -271,7 +272,7 @@ Never:
 - The CLI discovers all pages of Collections in the active workspace with an authorized browser session.
 - A first run shows a plan and downloads all confirmed new Collections.
 - Images use the largest listed quality and preserve every Set Placement.
-- The first video response produces a sanitized diagnostic and stops the run before image downloads.
+- Videos download with `--videos`; a video with no usable source becomes a missing Reference.
 - Output follows the documented hierarchy and each Collection has one valid normalized manifest.
 - S3 mode stores References, manifests, and the video-stop diagnostic in the bucket with the documented key layout.
 - `--interval` throttles every Pixieset API call and honors `Retry-After` on 429 responses.
@@ -281,7 +282,3 @@ Never:
 - `--verify` detects and restores missing or checksum-mismatched files.
 - Browser cookie import works while supported browsers are open on macOS and Linux.
 - Automated tests contain no account data or secrets and `go test ./...` and `go vet ./...` pass.
-
-## Open Questions
-
-- Capture a sanitized non-empty `videos` response in a later implementation session.
