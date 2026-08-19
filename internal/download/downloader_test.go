@@ -42,6 +42,22 @@ var syntheticJPEG = func() []byte {
 	return buf.Bytes()
 }()
 
+// syntheticMP4 is a minimal MP4: one ftyp box of 20 bytes (big-endian size,
+// "ftyp", major brand "isom", minor version 0, compatible brand "mp42"). The
+// "mp42" brand is required so http.DetectContentType reports video/mp4.
+var syntheticMP4 = func() []byte {
+	var buf bytes.Buffer
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], 20)
+	buf.Write(size[:])
+	buf.WriteString("ftyp")
+	buf.WriteString("isom")
+	var version [4]byte
+	buf.Write(version[:])
+	buf.WriteString("mp42")
+	return buf.Bytes()
+}()
+
 func loopbackDownloader(t *testing.T, handler http.Handler, options Options) (*Downloader, *httptest.Server) {
 	t.Helper()
 	server := httptest.NewServer(handler)
@@ -116,6 +132,12 @@ func oneWork(id string, variants []pixieset.ImageVariant, relative string) archi
 			RelativePath: relative,
 		}},
 	}
+}
+
+func videoWork(id string, variants []pixieset.ImageVariant, relative string) archive.DownloadWork {
+	work := oneWork(id, variants, relative)
+	work.MediaKind = archive.MediaKindVideo
+	return work
 }
 
 func setIDFromPath(relative string) string {
@@ -870,6 +892,74 @@ func TestDownloadRejectsTruncatedImage(t *testing.T) {
 	work := oneWork("bad", []pixieset.ImageVariant{{Quality: "large", URL: d.mediaOrigin + "/bad"}}, "Collection--100/Set--11/bad.jpg")
 	result := d.Download(context.Background(), fs, []archive.DownloadWork{work})[0]
 	assertFailureCode(t, result, CodeMalformedMedia)
+}
+
+func TestDownloadVideoSucceeds(t *testing.T) {
+	fs := openTestFS(t)
+	d, _ := loopbackDownloader(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write(syntheticMP4)
+	}), Options{})
+	work := videoWork("ref", []pixieset.ImageVariant{{Quality: "high", URL: d.mediaOrigin + "/video.mp4"}}, "Collection--100/Set--11/ref.mp4")
+	result := d.Download(context.Background(), fs, []archive.DownloadWork{work})[0]
+	assertSuccess(t, result, "high")
+	if got := mustReadFile(t, displayPath(t, fs, "Collection--100/Set--11/ref.mp4")); !reflect.DeepEqual(got, syntheticMP4) {
+		t.Fatalf("video file = %q", got)
+	}
+}
+
+func TestDownloadRejectsWrongMediaKind(t *testing.T) {
+	tests := []struct {
+		name        string
+		kind        archive.MediaKind
+		contentType string
+		body        []byte
+	}{
+		{name: "video served as image", kind: archive.MediaKindVideo, contentType: "image/jpeg", body: syntheticJPEG},
+		{name: "image served as video", kind: archive.MediaKindImage, contentType: "video/mp4", body: syntheticMP4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fs := openTestFS(t)
+			d, _ := loopbackDownloader(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				_, _ = w.Write(test.body)
+			}), Options{})
+			work := oneWork("ref", []pixieset.ImageVariant{{Quality: "large", URL: d.mediaOrigin + "/ref"}}, "Collection--100/Set--11/ref.jpg")
+			work.MediaKind = test.kind
+			result := d.Download(context.Background(), fs, []archive.DownloadWork{work})[0]
+			assertFailureCode(t, result, CodeMalformedMedia)
+		})
+	}
+}
+
+func TestDownloadRejectsVideoFromImageOrigin(t *testing.T) {
+	fs := openTestFS(t)
+	var calls atomic.Int32
+	d := productionDownloader(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return imageResponse(http.StatusOK, syntheticJPEG), nil
+	}))
+	work := videoWork("ref", []pixieset.ImageVariant{{Quality: "high", URL: "https://images.pixieset.com/video.mp4"}}, "Collection--100/Set--11/ref.mp4")
+	result := d.Download(context.Background(), fs, []archive.DownloadWork{work})[0]
+	assertFailureCode(t, result, CodeInvalidSource)
+	if calls.Load() != 0 {
+		t.Fatalf("invalid origin reached transport %d times", calls.Load())
+	}
+}
+
+func TestDownloadMapsVideoForbiddenToExpired(t *testing.T) {
+	fs := openTestFS(t)
+	d, _ := loopbackDownloader(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}), Options{})
+	video := videoWork("video", []pixieset.ImageVariant{{Quality: "high", URL: d.mediaOrigin + "/video"}}, "Collection--100/Set--11/video.mp4")
+	result := d.Download(context.Background(), fs, []archive.DownloadWork{video})[0]
+	assertFailureCode(t, result, CodeSourceExpired)
+
+	image := oneWork("image", []pixieset.ImageVariant{{Quality: "large", URL: d.mediaOrigin + "/image"}}, "Collection--100/Set--11/image.jpg")
+	result = d.Download(context.Background(), fs, []archive.DownloadWork{image})[0]
+	assertFailureCode(t, result, CodeSourceAuth)
 }
 
 func TestNewRejectsInvalidBounds(t *testing.T) {

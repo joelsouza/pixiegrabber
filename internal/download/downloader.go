@@ -49,6 +49,7 @@ const (
 	// encoded media response; minResponseSlack is the smallest per-reference
 	// allowance so a tiny source hint cannot starve a valid image.
 	maxEncodedBytes   int64 = 1 << 30
+	maxVideoBytes     int64 = 8 << 30
 	minResponseSlack  int64 = 1 << 20
 	maxImageDimension       = 65535
 	maxImagePixels          = 100_000_000
@@ -89,6 +90,7 @@ const (
 	CodeSourceUnavailable = "source_unavailable"
 	CodeSourceNotFound    = "source_not_found"
 	CodeSourceAuth        = "source_authentication"
+	CodeSourceExpired     = "source_expired"
 	CodeSourceHTTPStatus  = "source_http_status"
 	CodeRedirect          = "source_redirect"
 	CodeMalformedMedia    = "malformed_media"
@@ -337,18 +339,18 @@ type fetchResult struct {
 }
 
 func (d *Downloader) fetchSource(ctx context.Context, stage *os.File, work archive.DownloadWork) (string, string, *Failure) {
-	limit := mediaLimit(work.SourceBytes)
+	limit := mediaLimit(work.SourceBytes, work.MediaKind)
 	sawVariant := false
 	for _, variant := range work.Variants {
 		if variant.URL == "" {
 			continue
 		}
 		sawVariant = true
-		source, err := d.validateMediaURL(variant.URL)
+		source, err := d.validateMediaURL(variant.URL, work.MediaKind)
 		if err != nil {
 			return "", "", failure(CodeInvalidSource)
 		}
-		attempt := d.fetchVariant(ctx, stage, source, limit)
+		attempt := d.fetchVariant(ctx, stage, source, limit, work.MediaKind)
 		switch attempt.kind {
 		case fetchSuccess:
 			return variant.Quality, attempt.digest, nil
@@ -364,14 +366,18 @@ func (d *Downloader) fetchSource(ctx context.Context, stage *os.File, work archi
 	return "", "", failure(CodeSourceNotFound)
 }
 
-func mediaLimit(sourceBytes int64) int64 {
-	if sourceBytes <= 0 {
-		return maxEncodedBytes
+func mediaLimit(sourceBytes int64, kind archive.MediaKind) int64 {
+	cap := maxEncodedBytes
+	if kind == archive.MediaKindVideo {
+		cap = maxVideoBytes
 	}
-	return min(maxEncodedBytes, max(sourceBytes*2, minResponseSlack))
+	if sourceBytes <= 0 {
+		return cap
+	}
+	return min(cap, max(sourceBytes*2, minResponseSlack))
 }
 
-func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *url.URL, limit int64) fetchResult {
+func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *url.URL, limit int64, kind archive.MediaKind) fetchResult {
 	for attempt := 1; attempt <= d.maxAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return fetchResult{kind: fetchCanceled, failure: failure(CodeCanceled)}
@@ -432,6 +438,9 @@ func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *u
 			}
 			drainAndClose(response.Body)
 			if status == http.StatusUnauthorized || status == http.StatusForbidden {
+				if kind == archive.MediaKindVideo && status == http.StatusForbidden {
+					return fetchResult{kind: fetchFailure, failure: failure(CodeSourceExpired)}
+				}
 				return fetchResult{kind: fetchFailure, failure: failure(CodeSourceAuth)}
 			}
 			return fetchResult{kind: fetchFailure, failure: failure(CodeSourceHTTPStatus)}
@@ -445,24 +454,28 @@ func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *u
 			return fetchResult{kind: fetchFailure, failure: failure(CodeMalformedMedia)}
 		}
 		contentType, _, typeErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
-		if typeErr != nil || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
+		prefix := "image/"
+		if kind == archive.MediaKindVideo {
+			prefix = "video/"
+		}
+		if typeErr != nil || !strings.HasPrefix(strings.ToLower(contentType), prefix) {
 			drainAndClose(response.Body)
 			return fetchResult{kind: fetchFailure, failure: failure(CodeMalformedMedia)}
 		}
-		kind, digest := writeMediaResponse(ctx, response.Body, stage, limit)
-		if kind == fetchSuccess {
-			if err := validateImage(stage); err != nil {
+		writeKind, digest := writeMediaResponse(ctx, response.Body, stage, limit, kind)
+		if writeKind == fetchSuccess {
+			if err := validateMedia(stage, kind); err != nil {
 				return fetchResult{kind: fetchFailure, failure: failure(CodeMalformedMedia)}
 			}
 			return fetchResult{kind: fetchSuccess, digest: digest}
 		}
-		if kind == fetchLocal {
+		if writeKind == fetchLocal {
 			return fetchResult{kind: fetchFailure, failure: failure(CodeStaging)}
 		}
-		if kind == fetchCanceled || ctx.Err() != nil {
+		if writeKind == fetchCanceled || ctx.Err() != nil {
 			return fetchResult{kind: fetchCanceled, failure: failure(CodeCanceled)}
 		}
-		if kind == fetchFailure {
+		if writeKind == fetchFailure {
 			return fetchResult{kind: fetchFailure, failure: failure(CodeMalformedMedia)}
 		}
 		if attempt == d.maxAttempts {
@@ -475,7 +488,7 @@ func (d *Downloader) fetchVariant(ctx context.Context, stage *os.File, source *u
 	return fetchResult{kind: fetchFailure, failure: failure(CodeRetryExhausted)}
 }
 
-func writeMediaResponse(ctx context.Context, body io.ReadCloser, stage *os.File, limit int64) (fetchKind, string) {
+func writeMediaResponse(ctx context.Context, body io.ReadCloser, stage *os.File, limit int64, kind archive.MediaKind) (fetchKind, string) {
 	defer body.Close()
 	prefix := make([]byte, maxSniffBytes)
 	n, readErr := io.ReadFull(body, prefix)
@@ -490,7 +503,11 @@ func writeMediaResponse(ctx context.Context, body io.ReadCloser, stage *os.File,
 	}
 	detected := http.DetectContentType(prefix[:n])
 	detectedType, _, detectErr := mime.ParseMediaType(detected)
-	if detectErr != nil || !strings.HasPrefix(strings.ToLower(detectedType), "image/") {
+	mediaPrefix := "image/"
+	if kind == archive.MediaKindVideo {
+		mediaPrefix = "video/"
+	}
+	if detectErr != nil || !strings.HasPrefix(strings.ToLower(detectedType), mediaPrefix) {
 		return fetchFailure, ""
 	}
 	if err := stage.Truncate(0); err != nil {
@@ -569,6 +586,44 @@ func validateImage(stage *os.File) error {
 	return nil
 }
 
+// validateMedia validates the staged media for its kind. Images are decoded
+// and bounded; videos only get their MP4 ftyp box verified and are never
+// decoded.
+func validateMedia(stage *os.File, kind archive.MediaKind) error {
+	if kind == archive.MediaKindVideo {
+		return validateVideo(stage)
+	}
+	return validateImage(stage)
+}
+
+// validateVideo verifies only the MP4 ftyp box at the start of the staged
+// file. Videos are never decoded.
+func validateVideo(stage *os.File) error {
+	if _, err := stage.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	var header [8]byte
+	if _, err := io.ReadFull(stage, header[:]); err != nil {
+		return errors.New("video is too short")
+	}
+	size := uint32(header[0])<<24 | uint32(header[1])<<16 | uint32(header[2])<<8 | uint32(header[3])
+	if size < 16 {
+		return errors.New("video box is too small")
+	}
+	if string(header[4:8]) != "ftyp" {
+		return errors.New("video has no ftyp box")
+	}
+	info, err := stage.Stat()
+	if err != nil {
+		return err
+	}
+	if int64(size) > info.Size() {
+		return errors.New("video ftyp box exceeds the file")
+	}
+	_, err = stage.Seek(0, io.SeekStart)
+	return err
+}
+
 func writeAndHash(destination io.Writer, hash io.Writer, data []byte) error {
 	for len(data) > 0 {
 		count, err := destination.Write(data)
@@ -586,7 +641,7 @@ func writeAndHash(destination io.Writer, hash io.Writer, data []byte) error {
 	return nil
 }
 
-func (d *Downloader) validateMediaURL(raw string) (*url.URL, error) {
+func (d *Downloader) validateMediaURL(raw string, kind archive.MediaKind) (*url.URL, error) {
 	if strings.HasPrefix(raw, "//") {
 		raw = "https:" + raw
 	}
@@ -598,7 +653,11 @@ func (d *Downloader) validateMediaURL(raw string) (*url.URL, error) {
 		return nil, errors.New("invalid media source")
 	}
 	if d.mediaOrigin == productionMediaOrigin {
-		if !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Host, "images.pixieset.com") {
+		host := "images.pixieset.com"
+		if kind == archive.MediaKindVideo {
+			host = "stream.mux.com"
+		}
+		if !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Host, host) {
 			return nil, errors.New("invalid media source")
 		}
 		return parsed, nil
@@ -698,6 +757,7 @@ func failure(code string) *Failure {
 		CodeSourceUnavailable: "no usable media source was provided",
 		CodeSourceNotFound:    "no media variant was found",
 		CodeSourceAuth:        "media source requires authentication",
+		CodeSourceExpired:     "signed media link expired; run again",
 		CodeSourceHTTPStatus:  "media source returned an unsupported response",
 		CodeRedirect:          "media source redirect was rejected",
 		CodeMalformedMedia:    "media response is not a valid image",
