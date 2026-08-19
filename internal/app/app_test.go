@@ -34,10 +34,10 @@ func TestReportCookieSource(t *testing.T) {
 	}{
 		{
 			name:    "profile only",
-			session: browsercookies.Session{Browser: "chrome", Profile: "Your Chrome", SessionCookies: 5, TokenCookies: 1, Cookies: 19},
+			session: browsercookies.Session{Browser: "chrome", Profile: "Personal", SessionCookies: 5, TokenCookies: 1, Cookies: 19},
 			want: []string{
-				`Using chrome profile "Your Chrome" (5 session cookies, 19 Pixieset cookies).`,
-				`Override with --cookies-from-browser 'chrome:Your Chrome'.`,
+				`Using chrome profile "Personal" (5 session cookies, 19 Pixieset cookies).`,
+				`Override with --cookies-from-browser 'chrome:Personal'.`,
 			},
 			absent: []string{"Sign in to Pixieset again"},
 		},

@@ -43,15 +43,15 @@ Pixiegrabber finds your Pixieset session for you. It looks in each supported bro
 Pixiegrabber prints its choice, and the value that selects it again:
 
 ```
-Using chrome profile "Your Chrome" (5 session cookies, 19 Pixieset cookies).
-Override with --cookies-from-browser 'chrome:Your Chrome'.
+Using chrome profile "Personal" (5 session cookies, 19 Pixieset cookies).
+Override with --cookies-from-browser 'chrome:Personal'.
 ```
 
 If it finds no session, it lists each profile that it examined:
 
 ```
 no valid Pixieset cookies found; sign in to Pixieset and retry
-  chrome:Your Chrome — 0 Pixieset cookies
+  chrome:Personal — 0 Pixieset cookies
   firefox:default-release — 3 Pixieset cookies, no session cookie
 ```
 
@@ -98,9 +98,9 @@ Pixiegrabber locks the output directory while it runs. A second process cannot u
 A large account takes a long time to read. Pixiegrabber shows what it does while it works:
 
 ```
-Discovering collections: page 22/22, 521 found.
-[  1/521] Itau | Bad Bunny: 2 sets, 131 images
-[  2/521] TIMELESS: 1 set, 200 images
+Discovering collections: page 3/3, 60 found.
+[ 1/60] Example Collection: 2 sets, 131 images
+[ 2/60] Another Collection: 1 set, 200 images
 Downloading: 40/131 done, 0 failed.
 ```
 
